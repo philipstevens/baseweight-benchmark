@@ -1,0 +1,20 @@
+task_id: ledgar
+task_name: "Legal Document Classification"
+dataset_path: "coastalcph/lex_glue"
+dataset_config: "ledgar"
+task_type: classification
+num_classes: 100
+metric_id: weighted_f1
+metric_label: "Weighted F1"
+max_output_tokens: 32
+test_sample_size: 1000
+training_cap: 10000
+prompt_file: "prompts/ledgar.json"
+text_field: text
+label_field: label
+label_type: integer_mapped
+epochs_by_size:
+  small: 10
+  medium: 5
+  large: 3
+efficiency_curve_sizes: [50, 200, 500, 1000, 5000]

@@ -1,0 +1,8 @@
+{
+  "task_id": "cuad",
+  "system": "You are a contract analyst. Extract the exact text of the requested clause from the contract. If no such clause exists, respond with exactly: Not found.",
+  "user_template": "Contract:\n{context}\n\nQuestion: {question}\n\nExtract the clause text.",
+  "text_fields": ["context", "question"],
+  "answer_field": "answers",
+  "label_format": "extractive"
+}

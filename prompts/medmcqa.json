@@ -1,0 +1,9 @@
+{
+  "task_id": "medmcqa",
+  "system": "Answer the medical question by selecting the correct option. Respond with only the letter: A, B, C, or D.",
+  "user_template": "Question: {question}\n\nA) {opa}\nB) {opb}\nC) {opc}\nD) {opd}",
+  "label_format": "letter",
+  "text_fields": ["question", "opa", "opb", "opc", "opd"],
+  "label_field": "cop",
+  "label_map": {"0": "A", "1": "B", "2": "C", "3": "D"}
+}

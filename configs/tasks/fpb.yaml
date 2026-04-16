@@ -1,0 +1,23 @@
+task_id: fpb
+task_name: "Financial Sentiment"
+dataset_path: "takala/financial_phrasebank"
+dataset_config: "sentences_allagree"
+task_type: classification
+num_classes: 3
+metric_id: weighted_f1
+metric_label: "Weighted F1"
+max_output_tokens: 32
+test_sample_size: null
+training_cap: null
+prompt_file: "prompts/fpb.json"
+text_field: sentence
+label_field: label
+label_type: integer_mapped
+custom_label_names: ["negative", "neutral", "positive"]
+split_ratios: [0.70, 0.15, 0.15]
+split_seed: 42
+epochs_by_size:
+  small: 10
+  medium: 5
+  large: 3
+efficiency_curve_sizes: [50, 200, 500, 1000]

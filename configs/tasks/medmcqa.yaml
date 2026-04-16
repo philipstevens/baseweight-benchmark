@@ -1,0 +1,21 @@
+task_id: medmcqa
+task_name: "Medical Question Answering"
+dataset_path: "openlifescienceai/medmcqa"
+dataset_config: null
+task_type: classification
+num_classes: 4
+metric_id: accuracy
+metric_label: "Accuracy"
+max_output_tokens: 8
+test_sample_size: 1000
+test_split: validation
+training_cap: 10000
+prompt_file: "prompts/medmcqa.json"
+label_field: cop
+label_type: letter_mapped
+label_map: {0: "A", 1: "B", 2: "C", 3: "D"}
+epochs_by_size:
+  small: 10
+  medium: 5
+  large: 3
+efficiency_curve_sizes: [50, 200, 500, 1000, 5000]

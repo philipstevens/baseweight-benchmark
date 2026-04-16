@@ -1,0 +1,9 @@
+{
+  "task_id": "banking77",
+  "system": "Classify the customer message into one intent category. Respond with only the intent name, nothing else.",
+  "user_template": "Classify this customer message:\n\n{text}",
+  "label_format": "verbatim",
+  "text_field": "text",
+  "label_field": "label",
+  "label_type": "integer_mapped"
+}

@@ -1,0 +1,24 @@
+apis:
+  gpt-4.1:
+    input_per_m: 2.00
+    output_per_m: 8.00
+  gpt-4.1-mini:
+    input_per_m: 0.20
+    output_per_m: 0.80
+  gpt-4.1-nano:
+    input_per_m: 0.05
+    output_per_m: 0.20
+  claude-sonnet:
+    input_per_m: 3.00
+    output_per_m: 15.00
+  gemini-flash:
+    input_per_m: 0.15
+    output_per_m: 0.60
+  gpt-4.1-mini-sft:
+    input_per_m: 0.20
+    output_per_m: 0.80
+    training_per_m: 0.80
+
+self_hosted:
+  gpu_hourly_rate: 1.19
+  queries_per_hour_per_gpu: 2000  # conservative estimate, updated from eval

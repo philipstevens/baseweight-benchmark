@@ -1,0 +1,9 @@
+{
+  "task_id": "ledgar",
+  "system": "Classify the contract provision into one category. Respond with only the category name, nothing else.",
+  "user_template": "Classify this contract provision:\n\n{text}",
+  "label_format": "verbatim",
+  "text_field": "text",
+  "label_field": "label",
+  "label_type": "integer_mapped"
+}
