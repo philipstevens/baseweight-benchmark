@@ -17,7 +17,8 @@ import yaml
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
-from utils import build_messages, load_jsonl, write_jsonl
+from checkpoint_utils import append_jsonl, finalize_partial, load_partial_ids, partial_path
+from utils import build_messages, load_jsonl
 
 REPO_ROOT = Path(__file__).parent.parent
 load_dotenv(REPO_ROOT / ".env")
@@ -220,10 +221,22 @@ async def run_eval(
         click.echo(f"  SKIP [{model_cfg.model_short}/{task_id}/{condition}]: already exists")
         return
 
+    pp = partial_path(out_path)
+    completed_ids = load_partial_ids(pp)
+    pending_rows = [r for r in test_rows if r.get("id", "") not in completed_ids]
+
+    if completed_ids:
+        click.echo(f"  Resuming: {len(completed_ids)}/{len(test_rows)} rows already done")
+
+    if not pending_rows:
+        finalize_partial(pp, out_path)
+        click.echo(f"  All {len(test_rows)} rows complete, finalized to {out_path.relative_to(REPO_ROOT)}")
+        return
+
     model_name = "adapter" if adapter_path and adapter_path.exists() else model_cfg.model_id
     semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
 
-    async def process_row(row: dict, session: "aiohttp.ClientSession") -> dict:
+    async def process_row(row: dict, session: "aiohttp.ClientSession") -> None:
         msgs = build_messages(row, few_shot, condition)
         try:
             text, lat, ttft = await call_vllm(
@@ -231,7 +244,7 @@ async def run_eval(
             )
         except Exception as exc:
             text, lat, ttft = f"ERROR: {exc}", 0.0, 0.0
-        return {
+        result = {
             "id": row.get("id", ""),
             "model": model_cfg.model_short,
             "condition": condition,
@@ -244,17 +257,18 @@ async def run_eval(
             "ttft_ms": ttft,
             "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
+        append_jsonl(result, pp)
 
-    click.echo(f"  Evaluating {model_cfg.model_short}/{task_id}/{condition} ({len(test_rows)} examples)...")
+    click.echo(f"  Evaluating {model_cfg.model_short}/{task_id}/{condition} ({len(pending_rows)}/{len(test_rows)} rows)...")
     from tqdm.asyncio import tqdm
     async with aiohttp.ClientSession() as session:
-        predictions = await tqdm.gather(
-            *[process_row(r, session) for r in test_rows],
+        await tqdm.gather(
+            *[process_row(r, session) for r in pending_rows],
             desc=f"{model_cfg.model_short}/{task_id}",
         )
 
-    write_jsonl(predictions, out_path)
-    click.echo(f"  Saved {len(predictions)} predictions to {out_path.relative_to(REPO_ROOT)}")
+    finalize_partial(pp, out_path)
+    click.echo(f"  Saved {len(test_rows)} predictions to {out_path.relative_to(REPO_ROOT)}")
 
 
 @click.command()

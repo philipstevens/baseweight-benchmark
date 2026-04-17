@@ -19,6 +19,8 @@ from typing import Optional
 import click
 from dotenv import load_dotenv
 
+from checkpoint_utils import NETWORK_VOLUME
+
 REPO_ROOT = Path(__file__).parent.parent
 load_dotenv(REPO_ROOT / ".env")
 
@@ -60,29 +62,31 @@ def upload_file_safe(api, local_path: Path, remote_path: str, repo_id: str, repo
         return False
 
 
-def sync_prepared_data(api, dry_run: bool) -> int:
-    """Upload all prepared JSONL files to HuggingFace dataset repo."""
-    prepared_root = REPO_ROOT / "data" / "prepared"
-    if not prepared_root.exists():
-        click.echo("  No prepared data found — skipping")
-        return 0
-
+def _sync_files(
+    api, root: Path, files: list, remote_prefix: str,
+    repo_id: str, repo_type: str, label: str, dry_run: bool,
+) -> int:
     if not dry_run:
-        ensure_repo(api, DATASET_REPO, "dataset")
-
-    files = list(prepared_root.rglob("*.jsonl"))
+        ensure_repo(api, repo_id, repo_type)
     count = 0
     for f in files:
-        remote = f"prepared/{f.relative_to(prepared_root)}"
+        remote = f"{remote_prefix}/{f.relative_to(root)}"
         if dry_run:
             click.echo(f"  [dry-run] Would upload {remote}")
             count += 1
         else:
-            if upload_file_safe(api, f, remote, DATASET_REPO, "dataset"):
+            if upload_file_safe(api, f, remote, repo_id, repo_type):
                 count += 1
-
-    click.echo(f"  Prepared data: {count}/{len(files)} files synced to {DATASET_REPO}")
+    click.echo(f"  {label}: {count}/{len(files)} files synced")
     return count
+
+
+def sync_prepared_data(api, dry_run: bool) -> int:
+    root = REPO_ROOT / "data" / "prepared"
+    if not root.exists():
+        click.echo("  No prepared data found — skipping")
+        return 0
+    return _sync_files(api, root, list(root.rglob("*.jsonl")), "prepared", DATASET_REPO, "dataset", "Prepared data", dry_run)
 
 
 def sync_adapters(api, dry_run: bool) -> int:
@@ -133,85 +137,46 @@ def sync_adapters(api, dry_run: bool) -> int:
 
 
 def sync_predictions(api, dry_run: bool) -> int:
-    """Upload prediction JSONL files to HuggingFace dataset repo."""
-    pred_root = REPO_ROOT / "results" / "predictions"
-    if not pred_root.exists():
+    root = REPO_ROOT / "results" / "predictions"
+    if not root.exists():
         click.echo("  No predictions found — skipping")
         return 0
+    # Include both completed (.jsonl) and in-progress (.jsonl.partial) files.
+    files = sorted(list(root.rglob("*.jsonl")) + list(root.rglob("*.partial")))
+    return _sync_files(api, root, files, "predictions", PREDICTIONS_REPO, "dataset", "Predictions", dry_run)
 
-    if not dry_run:
-        ensure_repo(api, PREDICTIONS_REPO, "dataset")
 
-    files = list(pred_root.rglob("*.jsonl"))
-    count = 0
-    for f in files:
-        remote = f"predictions/{f.relative_to(pred_root)}"
-        if dry_run:
-            click.echo(f"  [dry-run] Would upload {remote}")
-            count += 1
-        else:
-            if upload_file_safe(api, f, remote, PREDICTIONS_REPO, "dataset"):
-                count += 1
-
-    click.echo(f"  Predictions: {count}/{len(files)} files synced to {PREDICTIONS_REPO}")
-    return count
+def sync_checkpoints(api, dry_run: bool) -> int:
+    # Full HF Trainer checkpoints live on the volume and are already persistent;
+    # only train_state.json is uploaded to survive a volume wipe.
+    root = NETWORK_VOLUME / "checkpoints"
+    if not root.exists():
+        click.echo("  No checkpoint state found — skipping")
+        return 0
+    return _sync_files(api, root, list(root.rglob("train_state.json")), "checkpoints", PREDICTIONS_REPO, "dataset", "Checkpoint state", dry_run)
 
 
 def sync_summaries(api, dry_run: bool) -> int:
-    """Upload summary JSON files to HuggingFace dataset repo."""
-    summary_root = REPO_ROOT / "results" / "summaries"
-    if not summary_root.exists():
+    root = REPO_ROOT / "results" / "summaries"
+    if not root.exists():
         click.echo("  No summaries found — skipping")
         return 0
-
-    if not dry_run:
-        ensure_repo(api, PREDICTIONS_REPO, "dataset")
-
-    files = list(summary_root.rglob("*.json"))
-    count = 0
-    for f in files:
-        remote = f"summaries/{f.relative_to(summary_root)}"
-        if dry_run:
-            click.echo(f"  [dry-run] Would upload {remote}")
-            count += 1
-        else:
-            if upload_file_safe(api, f, remote, PREDICTIONS_REPO, "dataset"):
-                count += 1
-
-    click.echo(f"  Summaries: {count}/{len(files)} files synced")
-    return count
+    return _sync_files(api, root, list(root.rglob("*.json")), "summaries", PREDICTIONS_REPO, "dataset", "Summaries", dry_run)
 
 
 def sync_training_metadata(api, dry_run: bool) -> int:
-    """Upload training metadata.json files."""
-    training_root = REPO_ROOT / "results" / "training"
-    if not training_root.exists():
+    root = REPO_ROOT / "results" / "training"
+    if not root.exists():
         click.echo("  No training metadata found — skipping")
         return 0
-
-    if not dry_run:
-        ensure_repo(api, PREDICTIONS_REPO, "dataset")
-
-    files = list(training_root.rglob("metadata.json"))
-    count = 0
-    for f in files:
-        remote = f"training/{f.relative_to(training_root)}"
-        if dry_run:
-            click.echo(f"  [dry-run] Would upload {remote}")
-            count += 1
-        else:
-            if upload_file_safe(api, f, remote, PREDICTIONS_REPO, "dataset"):
-                count += 1
-
-    click.echo(f"  Training metadata: {count}/{len(files)} files synced")
-    return count
+    return _sync_files(api, root, list(root.rglob("metadata.json")), "training", PREDICTIONS_REPO, "dataset", "Training metadata", dry_run)
 
 
 @click.command()
 @click.option(
     "--what",
     default="all",
-    type=click.Choice(["all", "data", "adapters", "predictions", "summaries"]),
+    type=click.Choice(["all", "data", "adapters", "predictions", "summaries", "checkpoints"]),
     help="What to sync",
 )
 @click.option("--dry-run", is_flag=True)
@@ -235,6 +200,9 @@ def main(what: str, dry_run: bool) -> None:
     if what in ("all", "summaries"):
         sync_summaries(api, dry_run)
         sync_training_metadata(api, dry_run)
+
+    if what in ("all", "checkpoints"):
+        sync_checkpoints(api, dry_run)
 
     click.echo("\nSync complete.")
 

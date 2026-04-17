@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -10,6 +11,14 @@ from typing import Optional
 import click
 import yaml
 from pydantic import BaseModel, Field
+
+from checkpoint_utils import (
+    atomic_write_json,
+    checkpoint_dir,
+    find_hf_resume_checkpoint,
+    load_train_state,
+    save_train_state,
+)
 
 REPO_ROOT = Path(__file__).parent.parent
 ALL_TASKS = ["banking77", "cuad"]
@@ -80,11 +89,22 @@ def train_one(
 
     adapter_dir = REPO_ROOT / "results" / "adapters" / model_cfg.model_short / task_id / condition
     log_dir = REPO_ROOT / "results" / "training" / model_cfg.model_short / task_id / condition
+    ckpt_dir = checkpoint_dir(model_cfg.model_short, task_id, condition)
     adapter_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     epochs = get_epochs(n_train)
     click.echo(f"  [{model_cfg.model_short}/{task_id}/{condition}] n={n_train}, epochs={epochs}, seq_len={seq_len}")
+
+    prior_state = load_train_state(model_cfg.model_short, task_id, condition)
+    if prior_state and prior_state.get("status") == "complete":
+        click.echo(f"  SKIP [{model_cfg.model_short}/{task_id}/{condition}]: already complete")
+        meta_path = log_dir / "metadata.json"
+        if meta_path.exists():
+            with open(meta_path) as f:
+                return json.load(f)
+        return {}
 
     if dry_run:
         click.echo(f"  [dry-run] Would train {model_cfg.model_id} on {data_path.name}")
@@ -94,9 +114,18 @@ def train_one(
             "training_cost": 0, "training_time_min": 0,
             "eval_loss": None, "model_used": model_cfg.model_id, "substituted": False,
         }
-        with open(log_dir / "metadata.json", "w") as f:
-            json.dump(meta, f, indent=2)
+        atomic_write_json(meta, log_dir / "metadata.json")
         return meta
+
+    # Detect an existing checkpoint to resume from.
+    resume_ckpt = find_hf_resume_checkpoint(model_cfg.model_short, task_id, condition)
+    if resume_ckpt:
+        click.echo(f"  Resuming from checkpoint: {resume_ckpt.name}")
+    save_train_state(model_cfg.model_short, task_id, condition, {
+        "status": "in_progress",
+        "epoch": 0,
+        "global_step": 0,
+    })
 
     try:
         from unsloth import FastModel
@@ -140,7 +169,19 @@ def train_one(
     )
 
     from trl import SFTTrainer, SFTConfig
+    from transformers import TrainerCallback
     import datasets as hf_datasets
+
+    class _CheckpointCallback(TrainerCallback):
+        """Sync lightweight state to network volume after each checkpoint so training can resume on pod restart."""
+        def on_save(self, args, state, control, **kwargs):
+            save_train_state(model_cfg.model_short, task_id, condition, {
+                "status": "in_progress",
+                "epoch": state.epoch,
+                "global_step": state.global_step,
+                "best_metric": state.best_metric,
+                "best_model_checkpoint": state.best_model_checkpoint,
+            })
 
     with open(data_path) as f:
         rows = [json.loads(line) for line in f]
@@ -163,7 +204,7 @@ def train_one(
 
     training_cfg = model_cfg.training
     sft_config = SFTConfig(
-        output_dir=str(log_dir),
+        output_dir=str(ckpt_dir),  # HF intermediate checkpoints → network volume
         num_train_epochs=epochs,
         per_device_train_batch_size=training_cfg.get("per_device_train_batch_size", 4),
         gradient_accumulation_steps=training_cfg.get("gradient_accumulation_steps", 4),
@@ -187,15 +228,25 @@ def train_one(
         packing=False,
     )
 
-    trainer = SFTTrainer(model=model, tokenizer=tokenizer, train_dataset=train_ds, args=sft_config)
+    trainer = SFTTrainer(
+        model=model, tokenizer=tokenizer, train_dataset=train_ds, args=sft_config,
+        callbacks=[_CheckpointCallback()],
+    )
 
     t0 = time.time()
-    result = trainer.train()
+    result = trainer.train(
+        resume_from_checkpoint=str(resume_ckpt) if resume_ckpt else None
+    )
     elapsed_min = (time.time() - t0) / 60
     training_cost = (elapsed_min / 60) * GPU_HOURLY
 
     model.save_pretrained(str(adapter_dir))
     tokenizer.save_pretrained(str(adapter_dir))
+
+    # Mirror to network volume so adapter survives pod termination
+    # even if REPO_ROOT is on local pod disk.
+    nv_adapter_dir = ckpt_dir / "final_adapter"
+    shutil.copytree(str(adapter_dir), str(nv_adapter_dir), dirs_exist_ok=True)
 
     eval_loss = result.metrics.get("eval_loss") if result.metrics else None
 
@@ -212,8 +263,14 @@ def train_one(
         "model_used": model_id,
         "substituted": substituted,
     }
-    with open(log_dir / "metadata.json", "w") as f:
-        json.dump(meta, f, indent=2)
+    atomic_write_json(meta, log_dir / "metadata.json")
+    atomic_write_json(meta, ckpt_dir / "metadata.json")
+    save_train_state(model_cfg.model_short, task_id, condition, {
+        "status": "complete",
+        "eval_loss": eval_loss,
+        "training_time_min": round(elapsed_min, 1),
+        "training_cost": round(training_cost, 4),
+    })
 
     click.echo(f"  Done: {elapsed_min:.1f} min, ${training_cost:.3f}, loss={eval_loss}")
 

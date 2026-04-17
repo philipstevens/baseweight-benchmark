@@ -15,7 +15,8 @@ import yaml
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
-from utils import build_messages, load_jsonl, write_jsonl
+from checkpoint_utils import append_jsonl, finalize_partial, load_partial_ids, partial_path
+from utils import build_messages, load_jsonl
 
 REPO_ROOT = Path(__file__).parent.parent
 load_dotenv(REPO_ROOT / ".env")
@@ -176,6 +177,18 @@ async def run_eval(model_id: str, task_id: str, condition: str, task_cfg: TaskCo
         click.echo(f"  SKIP [{model_id}/{task_id}/{condition}]: already exists")
         return
 
+    pp = partial_path(out_path)
+    completed_ids = load_partial_ids(pp)
+    pending_rows = [r for r in test_rows if r.get("id", "") not in completed_ids]
+
+    if completed_ids:
+        click.echo(f"  Resuming: {len(completed_ids)}/{len(test_rows)} rows already done")
+
+    if not pending_rows:
+        finalize_partial(pp, out_path)
+        click.echo(f"  All {len(test_rows)} rows complete, finalized to {out_path.relative_to(REPO_ROOT)}")
+        return
+
     if model_id in ANTHROPIC_MODELS:
         model_str = ANTHROPIC_MODELS[model_id]
         from anthropic import AsyncAnthropic
@@ -199,7 +212,7 @@ async def run_eval(model_id: str, task_id: str, condition: str, task_cfg: TaskCo
 
     semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
 
-    async def process_row(row: dict) -> dict:
+    async def process_row(row: dict) -> None:
         msgs = build_messages(row, few_shot, condition)
         ground_truth = row.get("label", "")
         try:
@@ -208,7 +221,7 @@ async def run_eval(model_id: str, task_id: str, condition: str, task_cfg: TaskCo
             )
         except Exception as exc:
             text, in_tok, out_tok, lat = f"ERROR: {exc}", 0, 0, 0
-        return {
+        result = {
             "id": row.get("id", ""),
             "model": model_id,
             "condition": condition,
@@ -220,13 +233,14 @@ async def run_eval(model_id: str, task_id: str, condition: str, task_cfg: TaskCo
             "latency_ms": lat,
             "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
+        append_jsonl(result, pp)
 
-    click.echo(f"  Evaluating {model_id}/{task_id}/{condition} ({len(test_rows)} examples)...")
+    click.echo(f"  Evaluating {model_id}/{task_id}/{condition} ({len(pending_rows)}/{len(test_rows)} rows)...")
     from tqdm.asyncio import tqdm
-    predictions = await tqdm.gather(*[process_row(r) for r in test_rows], desc=f"{model_id}/{task_id}")
+    await tqdm.gather(*[process_row(r) for r in pending_rows], desc=f"{model_id}/{task_id}")
 
-    write_jsonl(predictions, out_path)
-    click.echo(f"  Saved {len(predictions)} predictions to {out_path.relative_to(REPO_ROOT)}")
+    finalize_partial(pp, out_path)
+    click.echo(f"  Saved {len(test_rows)} predictions to {out_path.relative_to(REPO_ROOT)}")
 
 
 async def run_sft(task_id: str, task_cfg: TaskConfig, dry_run: bool) -> None:
