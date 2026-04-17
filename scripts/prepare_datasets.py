@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 
 REPO_ROOT = Path(__file__).parent.parent
 SEED = 42
-ALL_TASKS = ["ledgar", "cuad", "banking77", "fpb", "medmcqa", "mbpp"]
+ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa", "mbpp"]
 
 
 # ── Config models ──────────────────────────────────────────────────────────
@@ -289,10 +289,16 @@ def process_task(cfg: TaskConfig, dry_run: bool) -> None:
 
 
 @click.command()
-@click.option("--task", default="all", help="Task ID or 'all'")
+@click.option("--task", default=None, help="Task ID to prepare (required; use 'all' to prepare every task)")
 @click.option("--dry-run", is_flag=True, help="Validate without processing")
 def main(task: str, dry_run: bool) -> None:
-    """Prepare datasets: split, sample, and format into chat JSONL."""
+    """Prepare datasets: split, sample, and format into chat JSONL.
+
+    You must specify --task <id> or --task all. No default — raw data must
+    have been downloaded first for each task you want to prepare.
+    """
+    if task is None:
+        raise click.UsageError("--task is required. Pass a task ID or 'all' to prepare every downloaded task.")
     task_ids = ALL_TASKS if task == "all" else [task]
     failures = []
     for tid in task_ids:

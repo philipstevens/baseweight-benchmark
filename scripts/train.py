@@ -1,4 +1,4 @@
-"""QLoRA fine-tuning for all open-source models and tasks."""
+"""QLoRA fine-tuning for Qwen3-8B on BANKING77 and CUAD."""
 from __future__ import annotations
 
 import json
@@ -12,9 +12,9 @@ import yaml
 from pydantic import BaseModel, Field
 
 REPO_ROOT = Path(__file__).parent.parent
-ALL_TASKS = ["ledgar", "cuad", "banking77", "fpb", "medmcqa", "mbpp"]
-ALL_MODELS = ["qwen3-8b", "gemma3-4b", "phi4-mini"]
-GPU_HOURLY = 1.19
+ALL_TASKS = ["banking77", "cuad"]
+ALL_MODELS = ["qwen3-8b"]
+GPU_HOURLY = 0.49  # RTX 4090 on RunPod ($0.44–0.54/hr midpoint)
 
 
 class ModelConfig(BaseModel):
@@ -23,6 +23,7 @@ class ModelConfig(BaseModel):
     max_seq_length: int = 2048
     load_in_4bit: bool = True
     dtype: str = "bfloat16"
+    enable_thinking: Optional[bool] = None
     fallback_model_id: Optional[str] = None
     lora: dict = Field(default_factory=dict)
     training: dict = Field(default_factory=dict)
@@ -31,6 +32,7 @@ class ModelConfig(BaseModel):
 class TaskConfig(BaseModel):
     task_id: str
     training_cap: Optional[int] = None
+    max_seq_length: Optional[int] = None  # overrides model max_seq_length when set
     efficiency_curve_sizes: list[int] = Field(default_factory=list)
 
 
@@ -65,44 +67,50 @@ def count_jsonl(path: Path) -> int:
 
 def train_one(
     model_cfg: ModelConfig,
-    task_id: str,
+    task_cfg: TaskConfig,
     condition: str,
     data_path: Path,
     dry_run: bool,
+    auto_upload: bool = False,
 ) -> dict:
-    """Train a single model/task/condition combination. Returns metadata dict."""
+    """Train a single model/task/condition. Returns metadata dict."""
+    task_id = task_cfg.task_id
     n_train = count_jsonl(data_path)
+    seq_len = task_cfg.max_seq_length or model_cfg.max_seq_length
+
     adapter_dir = REPO_ROOT / "results" / "adapters" / model_cfg.model_short / task_id / condition
     log_dir = REPO_ROOT / "results" / "training" / model_cfg.model_short / task_id / condition
     adapter_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
 
     epochs = get_epochs(n_train)
-    click.echo(f"  [{model_cfg.model_short}/{task_id}/{condition}] n={n_train}, epochs={epochs}")
+    click.echo(f"  [{model_cfg.model_short}/{task_id}/{condition}] n={n_train}, epochs={epochs}, seq_len={seq_len}")
 
     if dry_run:
         click.echo(f"  [dry-run] Would train {model_cfg.model_id} on {data_path.name}")
-        meta = {"model_id": model_cfg.model_short, "task_id": task_id, "condition": condition,
-                "n_train": n_train, "epochs": epochs, "training_cost": 0, "training_time_min": 0,
-                "eval_loss": None, "model_used": model_cfg.model_id, "substituted": False}
+        meta = {
+            "model_id": model_cfg.model_short, "task_id": task_id, "condition": condition,
+            "n_train": n_train, "epochs": epochs, "seq_len": seq_len,
+            "training_cost": 0, "training_time_min": 0,
+            "eval_loss": None, "model_used": model_cfg.model_id, "substituted": False,
+        }
         with open(log_dir / "metadata.json", "w") as f:
             json.dump(meta, f, indent=2)
         return meta
 
-    # Lazy imports — only needed for actual training
     try:
         from unsloth import FastModel
         model_id = model_cfg.model_id
         substituted = False
     except ImportError:
-        raise RuntimeError("Unsloth not installed. Run: pip install 'unsloth[cu124]'")
+        raise RuntimeError("Unsloth not installed. Run: pip install 'unsloth[cu124-torch260]'")
 
     try:
         model, tokenizer = FastModel.from_pretrained(
             model_name=model_id,
-            max_seq_length=model_cfg.max_seq_length,
+            max_seq_length=seq_len,
             load_in_4bit=model_cfg.load_in_4bit,
-            dtype=None,  # auto
+            dtype=None,
         )
     except Exception as exc:
         if model_cfg.fallback_model_id:
@@ -111,7 +119,7 @@ def train_one(
             substituted = True
             model, tokenizer = FastModel.from_pretrained(
                 model_name=model_id,
-                max_seq_length=model_cfg.max_seq_length,
+                max_seq_length=seq_len,
                 load_in_4bit=model_cfg.load_in_4bit,
                 dtype=None,
             )
@@ -132,13 +140,26 @@ def train_one(
     )
 
     from trl import SFTTrainer, SFTConfig
-    from datasets import Dataset
     import datasets as hf_datasets
 
-    # Load JSONL training data
     with open(data_path) as f:
         rows = [json.loads(line) for line in f]
     train_ds = hf_datasets.Dataset.from_list(rows)
+
+    # For Qwen3 with enable_thinking=False, pre-apply the chat template so
+    # the <think> tokens are never generated during training.
+    if model_cfg.enable_thinking is False:
+        def apply_template(example):
+            return {"text": tokenizer.apply_chat_template(
+                example["messages"],
+                tokenize=False,
+                add_generation_prompt=False,
+                enable_thinking=False,
+            )}
+        train_ds = train_ds.map(apply_template)
+        dataset_text_field = "text"
+    else:
+        dataset_text_field = "messages"
 
     training_cfg = model_cfg.training
     sft_config = SFTConfig(
@@ -161,8 +182,8 @@ def train_one(
         greater_is_better=training_cfg.get("greater_is_better", False),
         logging_steps=training_cfg.get("logging_steps", 10),
         report_to=training_cfg.get("report_to", "none"),
-        max_seq_length=model_cfg.max_seq_length,
-        dataset_text_field="messages",
+        max_seq_length=seq_len,
+        dataset_text_field=dataset_text_field,
         packing=False,
     )
 
@@ -173,13 +194,10 @@ def train_one(
     elapsed_min = (time.time() - t0) / 60
     training_cost = (elapsed_min / 60) * GPU_HOURLY
 
-    # Save adapter
     model.save_pretrained(str(adapter_dir))
     tokenizer.save_pretrained(str(adapter_dir))
 
-    eval_loss = None
-    if result.metrics:
-        eval_loss = result.metrics.get("eval_loss")
+    eval_loss = result.metrics.get("eval_loss") if result.metrics else None
 
     meta = {
         "model_id": model_cfg.model_short,
@@ -187,6 +205,7 @@ def train_one(
         "condition": condition,
         "n_train": n_train,
         "epochs": epochs,
+        "seq_len": seq_len,
         "training_cost": round(training_cost, 4),
         "training_time_min": round(elapsed_min, 1),
         "eval_loss": eval_loss,
@@ -197,17 +216,33 @@ def train_one(
         json.dump(meta, f, indent=2)
 
     click.echo(f"  Done: {elapsed_min:.1f} min, ${training_cost:.3f}, loss={eval_loss}")
+
+    if auto_upload:
+        _upload_adapter(model_cfg.model_short, task_id, condition)
+
     return meta
 
 
+def _upload_adapter(model_short: str, task_id: str, condition: str) -> None:
+    import subprocess
+    click.echo(f"  Auto-uploading {model_short}/{task_id}/{condition} to HuggingFace...")
+    result = subprocess.run(
+        ["python", str(REPO_ROOT / "scripts" / "upload_artifacts.py"),
+         "--model", model_short, "--task", task_id, "--condition", condition],
+        capture_output=False,
+    )
+    if result.returncode != 0:
+        click.echo(f"  WARNING: upload failed (exit {result.returncode})", err=True)
+
+
 @click.command()
-@click.option("--model", required=True, help="Model ID (qwen3-8b|gemma3-4b|phi4-mini)")
+@click.option("--model", default="qwen3-8b", help="Model ID or 'all'")
 @click.option("--task", default="all", help="Task ID or 'all'")
 @click.option("--condition", default="all", help="lora-500|lora-full|all")
-@click.option("--efficiency-curve", is_flag=True, help="Run efficiency curve sizes for this model")
+@click.option("--auto-upload", is_flag=True, help="Upload adapter to HuggingFace after each run (persistence)")
 @click.option("--dry-run", is_flag=True, help="Validate configs without training")
-def main(model: str, task: str, condition: str, efficiency_curve: bool, dry_run: bool) -> None:
-    """QLoRA fine-tune open-source models on benchmark tasks."""
+def main(model: str, task: str, condition: str, auto_upload: bool, dry_run: bool) -> None:
+    """QLoRA fine-tune Qwen3-8B on BANKING77 and CUAD."""
     model_ids = ALL_MODELS if model == "all" else [model]
     task_ids = ALL_TASKS if task == "all" else [task]
     conditions = ["lora-500", "lora-full"] if condition == "all" else [condition]
@@ -216,33 +251,20 @@ def main(model: str, task: str, condition: str, efficiency_curve: bool, dry_run:
     for mid in model_ids:
         model_cfg = load_model_config(mid)
         for tid in task_ids:
-            task_cfg = load_task_config(tid)
+            task_cfg = load_task_config(tid)  # load once per task, not per condition
             prepared_dir = REPO_ROOT / "data" / "prepared" / tid
-
-            if not efficiency_curve:
-                for cond in conditions:
-                    data_file = prepared_dir / ("train_500.jsonl" if cond == "lora-500" else "train_full.jsonl")
-                    if not data_file.exists():
-                        click.echo(f"  SKIP [{mid}/{tid}/{cond}]: {data_file} not found", err=True)
-                        if not dry_run:
-                            failures.append((f"{mid}/{tid}/{cond}", "data file missing"))
-                        continue
-                    try:
-                        train_one(model_cfg, tid, cond, data_file, dry_run)
-                    except Exception as exc:
-                        click.echo(f"  ERROR [{mid}/{tid}/{cond}]: {exc}", err=True)
-                        failures.append((f"{mid}/{tid}/{cond}", str(exc)))
-            else:
-                for n in task_cfg.efficiency_curve_sizes:
-                    data_file = prepared_dir / f"train_{n}.jsonl"
-                    if not data_file.exists():
-                        click.echo(f"  SKIP [{mid}/{tid}/lora-{n}]: data not found")
-                        continue
-                    try:
-                        train_one(model_cfg, tid, f"lora-{n}", data_file, dry_run)
-                    except Exception as exc:
-                        click.echo(f"  ERROR [{mid}/{tid}/lora-{n}]: {exc}", err=True)
-                        failures.append((f"{mid}/{tid}/lora-{n}", str(exc)))
+            for cond in conditions:
+                data_file = prepared_dir / ("train_500.jsonl" if cond == "lora-500" else "train_full.jsonl")
+                if not data_file.exists():
+                    click.echo(f"  SKIP [{mid}/{tid}/{cond}]: {data_file} not found", err=True)
+                    if not dry_run:
+                        failures.append((f"{mid}/{tid}/{cond}", "data file missing"))
+                    continue
+                try:
+                    train_one(model_cfg, task_cfg, cond, data_file, dry_run, auto_upload=auto_upload)
+                except Exception as exc:
+                    click.echo(f"  ERROR [{mid}/{tid}/{cond}]: {exc}", err=True)
+                    failures.append((f"{mid}/{tid}/{cond}", str(exc)))
 
     if failures:
         click.echo(f"\nFAILED ({len(failures)}):")

@@ -16,7 +16,7 @@ from pydantic import BaseModel
 REPO_ROOT = Path(__file__).parent.parent
 load_dotenv(REPO_ROOT / ".env")
 
-ALL_TASKS = ["ledgar", "cuad", "banking77", "fpb", "medmcqa", "mbpp"]
+ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa", "mbpp"]
 ALL_MODELS = ["qwen3-8b", "gemma3-4b", "phi4-mini"]
 
 HF_COLLECTION_SLUG = "baseweight/baseweight-benchmark-adapters"

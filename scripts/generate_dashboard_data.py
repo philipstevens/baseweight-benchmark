@@ -11,26 +11,43 @@ import yaml
 from pydantic import BaseModel, Field
 
 REPO_ROOT = Path(__file__).parent.parent
-ALL_TASKS = ["ledgar", "cuad", "banking77", "fpb", "medmcqa", "mbpp"]
+ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa", "mbpp"]
 
 # Model display names and families
 MODEL_META = {
-    # open-source
-    "qwen3-8b":   {"display_name": "Qwen3-8B",         "family": "open-source"},
-    "gemma3-4b":  {"display_name": "Gemma 3 4B",        "family": "open-source"},
-    "phi4-mini":  {"display_name": "Phi-4 Mini",        "family": "open-source"},
-    # frontier
-    "gpt-4.1":         {"display_name": "GPT-4.1",           "family": "frontier"},
-    "gpt-4.1-mini":    {"display_name": "GPT-4.1 Mini",      "family": "frontier"},
-    "gpt-4.1-nano":    {"display_name": "GPT-4.1 Nano",      "family": "frontier"},
-    "claude-sonnet":   {"display_name": "Claude Sonnet 4.6", "family": "frontier"},
-    "gemini-flash":    {"display_name": "Gemini 2.5 Flash",  "family": "frontier"},
-    # api fine-tuned
-    "gpt-4.1-mini-sft": {"display_name": "GPT-4.1 Mini SFT", "family": "api-finetuned"},
+    # open-source (QLoRA fine-tuned)
+    "qwen3-8b":         {"display_name": "Qwen3-8B (LoRA)",         "family": "open-source"},
+    "gemma3-4b":        {"display_name": "Gemma 3 4B (LoRA)",       "family": "open-source"},
+    "phi4-mini":        {"display_name": "Phi-4 Mini (LoRA)",        "family": "open-source"},
+    # OpenAI frontier
+    "gpt-5.4":          {"display_name": "GPT-5.4",                  "family": "frontier"},
+    "gpt-4.1":          {"display_name": "GPT-4.1",                  "family": "frontier"},
+    "gpt-4.1-mini":     {"display_name": "GPT-4.1 Mini",             "family": "frontier"},
+    "gpt-4.1-nano":     {"display_name": "GPT-4.1 Nano",             "family": "frontier"},
+    # Anthropic frontier
+    "claude-sonnet-4":  {"display_name": "Claude Sonnet 4",          "family": "frontier"},
+    # Google frontier
+    "gemini-2.5-flash": {"display_name": "Gemini 2.5 Flash",         "family": "frontier"},
+    # API fine-tuned
+    "gpt-4.1-sft":      {"display_name": "GPT-4.1 (SFT-500)",       "family": "api-finetuned"},
 }
 
-# GPU cost for self-hosted models
-GPU_HOURLY = 1.19  # $/hour
+# Conditions per model
+MODEL_CONDITIONS = {
+    "qwen3-8b":         ["lora-500", "lora-full"],
+    "gemma3-4b":        ["lora-500", "lora-full"],
+    "phi4-mini":        ["lora-500", "lora-full"],
+    "gpt-5.4":          ["zero-shot", "5-shot"],
+    "gpt-4.1":          ["zero-shot", "5-shot"],
+    "gpt-4.1-mini":     ["zero-shot", "5-shot"],
+    "gpt-4.1-nano":     ["zero-shot", "5-shot"],
+    "claude-sonnet-4":  ["zero-shot", "5-shot"],
+    "gemini-2.5-flash": ["zero-shot", "5-shot"],
+    "gpt-4.1-sft":      ["api-sft-500"],
+}
+
+# GPU cost for self-hosted models (loaded from pricing.yaml)
+GPU_HOURLY = 0.49  # RTX 4090 on RunPod
 QUERIES_PER_HOUR = 2000
 
 
@@ -117,7 +134,7 @@ def load_training_meta(model_short: str, task_id: str, condition: str) -> Option
 
 
 def load_sft_training_meta(task_id: str) -> Optional[dict]:
-    path = REPO_ROOT / "results" / "training" / "gpt-4.1-mini-sft" / task_id / "metadata.json"
+    path = REPO_ROOT / "results" / "training" / "gpt-4.1-sft" / task_id / "metadata.json"
     if not path.exists():
         return None
     with open(path) as f:
@@ -178,7 +195,7 @@ def build_result(
     }
 
 
-def build_efficiency_points(task_id: str, pricing: PricingConfig) -> list[dict]:
+def build_efficiency_points(task_id: str) -> list[dict]:
     """Build efficiency curve data for qwen3-8b (all efficiency sizes)."""
     points = []
     task_path = REPO_ROOT / "configs" / "tasks" / f"{task_id}.yaml"
@@ -211,33 +228,19 @@ def build_dashboard_data(daily_volume: int = 10000) -> dict:
     efficiency_data: dict[str, list] = {}
 
     for task_id in ALL_TASKS:
-        # Open-source: zero-shot, 5-shot, lora-500, lora-full
-        for model_short in ["qwen3-8b", "gemma3-4b", "phi4-mini"]:
-            for condition in ["zero-shot", "5-shot", "lora-500", "lora-full"]:
-                summary = load_summary(model_short, task_id, condition)
+        for model_id, conditions in MODEL_CONDITIONS.items():
+            for condition in conditions:
                 training_meta = None
                 if condition.startswith("lora-"):
-                    training_meta = load_training_meta(model_short, task_id, condition)
-                result = build_result(model_short, task_id, condition, summary, training_meta, pricing, daily_volume)
-                results.append(result)
-
-        # Frontier API: zero-shot, 5-shot
-        for model_id in ["gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "claude-sonnet", "gemini-flash"]:
-            for condition in ["zero-shot", "5-shot"]:
+                    training_meta = load_training_meta(model_id, task_id, condition)
+                elif condition == "api-sft-500":
+                    training_meta = load_sft_training_meta(task_id)
                 summary = load_summary(model_id, task_id, condition)
-                result = build_result(model_id, task_id, condition, summary, None, pricing, daily_volume)
+                result = build_result(model_id, task_id, condition, summary, training_meta, pricing, daily_volume)
                 results.append(result)
 
-        # API fine-tuned
-        sft_condition = "api-sft-500"
-        sft_summary = load_summary("gpt-4.1-mini-sft", task_id, sft_condition)
-        sft_training = load_sft_training_meta(task_id)
-        result = build_result("gpt-4.1-mini-sft", task_id, sft_condition, sft_summary, sft_training, pricing, daily_volume)
-        results.append(result)
-
-        # Efficiency curve
         try:
-            efficiency_data[task_id] = build_efficiency_points(task_id, pricing)
+            efficiency_data[task_id] = build_efficiency_points(task_id)
         except Exception:
             efficiency_data[task_id] = []
 

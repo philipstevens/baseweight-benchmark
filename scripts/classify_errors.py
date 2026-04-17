@@ -12,8 +12,10 @@ import click
 import yaml
 from pydantic import BaseModel, Field
 
+from utils import load_jsonl, write_jsonl as _write_jsonl
+
 REPO_ROOT = Path(__file__).parent.parent
-ALL_TASKS = ["ledgar", "cuad", "banking77", "fpb", "medmcqa", "mbpp"]
+ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa", "mbpp"]
 
 
 class TaskConfig(BaseModel):
@@ -27,11 +29,6 @@ def load_task_config(task_id: str) -> TaskConfig:
     with open(path) as f:
         data = yaml.safe_load(f)
     return TaskConfig(**{k: v for k, v in data.items() if k in TaskConfig.model_fields})
-
-
-def load_jsonl(path: Path) -> list[dict]:
-    with open(path) as f:
-        return [json.loads(line) for line in f]
 
 
 def write_json(data: dict, path: Path) -> None:
@@ -202,16 +199,15 @@ def compute_metric(task_cfg: TaskConfig, classified_rows: list[dict]) -> Optiona
     """Compute primary metric value from classified predictions."""
     metric = task_cfg.metric_id
 
-    if metric == "macro_f1":
-        # Classification: macro F1 over true labels
+    if metric in ("macro_f1", "weighted_f1"):
         from sklearn.metrics import f1_score
+        average = "weighted" if metric == "weighted_f1" else "macro"
         y_true, y_pred = [], []
         for r in classified_rows:
             y_true.append(r["ground_truth"])
-            # Map non-correct to ground_truth's opposite to compute properly
             y_pred.append(r["predicted_clean"])
         try:
-            score = f1_score(y_true, y_pred, average="macro", zero_division=0)
+            score = f1_score(y_true, y_pred, average=average, zero_division=0)
         except Exception:
             score = None
         return score
@@ -300,7 +296,7 @@ def process_model_task_condition(
 
     # Write classified predictions
     classified_path = REPO_ROOT / "results" / "classified" / model_short / task_id / f"{condition}.jsonl"
-    write_jsonl_direct(classified, classified_path)
+    _write_jsonl(classified, classified_path)
 
     # Compute metric
     metric_value = compute_metric(task_cfg, classified)
@@ -341,20 +337,15 @@ def process_model_task_condition(
     return summary
 
 
-def write_jsonl_direct(rows: list[dict], path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
-
-
 def get_valid_labels(task_id: str) -> Optional[list[str]]:
-    """Return valid output labels for classification tasks, or None."""
-    label_map = {
-        "banking77": None,  # too many (77 classes) — skip format check
-        "fpb": ["positive", "negative", "neutral"],
-        "medmcqa": ["A", "B", "C", "D"],
-        "ledgar": None,  # many provision types — skip format check
+    """Return valid output labels for classification tasks, or None (no format check)."""
+    label_map: dict[str, Optional[list[str]]] = {
+        "banking77":  None,  # 77 classes — too many to enumerate
+        "cuad":       None,  # extraction — no fixed label set
+        "ledgar":     None,  # many provision types — skip format check
+        "fpb":        ["positive", "negative", "neutral"],
+        "medmcqa":    ["A", "B", "C", "D"],
+        "mbpp":       None,  # code generation — no fixed label set
     }
     return label_map.get(task_id)
 

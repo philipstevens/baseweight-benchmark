@@ -4,11 +4,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import resource
 import signal
 import subprocess
 import sys
-import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,10 +17,12 @@ import yaml
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
+from utils import build_messages, load_jsonl, write_jsonl
+
 REPO_ROOT = Path(__file__).parent.parent
 load_dotenv(REPO_ROOT / ".env")
 
-ALL_TASKS = ["ledgar", "cuad", "banking77", "fpb", "medmcqa", "mbpp"]
+ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa", "mbpp"]
 ALL_MODELS = ["qwen3-8b", "gemma3-4b", "phi4-mini"]
 
 MAX_CONCURRENCY = 4
@@ -36,12 +36,14 @@ class TaskConfig(BaseModel):
     task_id: str
     max_output_tokens: int
     task_type: str
+    max_seq_length: Optional[int] = None
 
 
 class ModelConfig(BaseModel):
     model_id: str
     model_short: str
     max_seq_length: int = 2048
+    enable_thinking: Optional[bool] = None
     fallback_model_id: Optional[str] = None
 
 
@@ -59,35 +61,14 @@ def load_model_config(model_id: str) -> ModelConfig:
     return ModelConfig(**{k: v for k, v in data.items() if k in ModelConfig.model_fields})
 
 
-def load_jsonl(path: Path) -> list[dict]:
-    with open(path) as f:
-        return [json.loads(line) for line in f]
 
 
-def write_jsonl(rows: list[dict], path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
-
-
-def build_messages(prompt_row: dict, few_shot: list[dict], condition: str) -> list[dict]:
-    """Build message list, optionally prepending few-shot examples."""
-    base = prompt_row["messages"]
-    if condition == "5-shot" and few_shot:
-        system = base[0]
-        user = base[1]
-        shots = []
-        for ex in few_shot:
-            msgs = ex.get("messages", [])
-            if len(msgs) >= 3:
-                shots.append(msgs[1])
-                shots.append(msgs[2])
-        return [system] + shots + [user]
-    return base
-
-
-def start_vllm_server(base_model: str, adapter_path: Optional[Path], max_seq_length: int) -> subprocess.Popen:
+def start_vllm_server(
+    base_model: str,
+    adapter_path: Optional[Path],
+    max_seq_length: int,
+    enable_thinking: Optional[bool] = None,
+) -> subprocess.Popen:
     """Start vLLM server process."""
     cmd = [
         "vllm", "serve", base_model,
@@ -96,6 +77,9 @@ def start_vllm_server(base_model: str, adapter_path: Optional[Path], max_seq_len
         "--gpu-memory-utilization", "0.9",
         "--port", "8000",
     ]
+    # Pass enable_thinking=False for Qwen3 to suppress chain-of-thought tokens
+    if enable_thinking is False:
+        cmd += ["--chat-template-kwargs", '{"enable_thinking": false}']
     if adapter_path and adapter_path.exists():
         cmd += [
             "--enable-lora",
@@ -144,12 +128,13 @@ async def wait_for_vllm(timeout: int = VLLM_HEALTH_TIMEOUT) -> bool:
 
 
 async def call_vllm(
+    session: "aiohttp.ClientSession",
     model_name: str,
     messages: list[dict],
     max_tokens: int,
     semaphore: asyncio.Semaphore,
-) -> tuple[str, int, int, float, float]:
-    """Call vLLM via OpenAI-compatible API. Returns (text, in_tok, out_tok, latency_ms, ttft_ms)."""
+) -> tuple[str, float, float]:
+    """Stream one request. Returns (text, latency_ms, ttft_ms)."""
     import aiohttp
 
     payload = {
@@ -165,85 +150,40 @@ async def call_vllm(
             try:
                 t0 = time.time()
                 ttft_ms = 0.0
-                chunks = []
+                chunks: list[str] = []
+                first_token = True
 
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(
-                        f"{VLLM_HOST}/v1/chat/completions",
-                        json=payload,
-                        timeout=aiohttp.ClientTimeout(total=300),
-                    ) as resp:
-                        resp.raise_for_status()
-                        first_token = True
-                        async for raw_line in resp.content:
-                            line = raw_line.decode("utf-8").strip()
-                            if not line.startswith("data:"):
-                                continue
-                            data_str = line[5:].strip()
-                            if data_str == "[DONE]":
-                                break
-                            try:
-                                data = json.loads(data_str)
-                            except json.JSONDecodeError:
-                                continue
-                            delta = data.get("choices", [{}])[0].get("delta", {})
-                            content = delta.get("content", "")
-                            if content and first_token:
+                async with session.post(
+                    f"{VLLM_HOST}/v1/chat/completions",
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=300),
+                ) as resp:
+                    resp.raise_for_status()
+                    async for raw_line in resp.content:
+                        line = raw_line.decode("utf-8").strip()
+                        if not line.startswith("data:"):
+                            continue
+                        data_str = line[5:].strip()
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            data = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+                        content = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                        if content:
+                            if first_token:
                                 ttft_ms = (time.time() - t0) * 1000
                                 first_token = False
-                            if content:
-                                chunks.append(content)
+                            chunks.append(content)
 
-                latency_ms = (time.time() - t0) * 1000
-                text = "".join(chunks)
-                # Token counts not available from streaming; estimate
-                in_tok = 0
-                out_tok = 0
-                return text, in_tok, out_tok, latency_ms, ttft_ms
+                return "".join(chunks), (time.time() - t0) * 1000, ttft_ms
 
-            except Exception as exc:
+            except Exception:
                 if attempt == MAX_RETRIES - 1:
                     raise
                 await asyncio.sleep(2 ** attempt)
-    return "", 0, 0, 0, 0
-
-
-def run_mbpp_tests(code: str, test_list: list[str], timeout: int = 5) -> tuple[bool, str]:
-    """Run MBPP test assertions in a subprocess sandbox. Returns (passed, error_msg)."""
-    full_code = code + "\n" + "\n".join(test_list)
-    script = f"""
-import resource, sys
-resource.setrlimit(resource.RLIMIT_CPU, ({timeout}, {timeout}))
-resource.setrlimit(resource.RLIMIT_AS, (256 * 1024 * 1024, 256 * 1024 * 1024))
-exec(compile({repr(full_code)}, '<mbpp>', 'exec'))
-"""
-    try:
-        result = subprocess.run(
-            [sys.executable, "-c", script],
-            capture_output=True,
-            text=True,
-            timeout=timeout + 2,
-        )
-        if result.returncode == 0:
-            return True, ""
-        return False, (result.stderr or result.stdout).strip()[:500]
-    except subprocess.TimeoutExpired:
-        return False, "timeout"
-    except Exception as exc:
-        return False, str(exc)
-
-
-def extract_code(text: str) -> str:
-    """Extract Python code from model output (strips markdown fences)."""
-    if "```python" in text:
-        start = text.find("```python") + len("```python")
-        end = text.find("```", start)
-        return text[start:end].strip() if end != -1 else text[start:].strip()
-    if "```" in text:
-        start = text.find("```") + 3
-        end = text.find("```", start)
-        return text[start:end].strip() if end != -1 else text[start:].strip()
-    return text.strip()
+    return "", 0.0, 0.0
 
 
 async def run_eval(
@@ -254,6 +194,8 @@ async def run_eval(
     adapter_path: Optional[Path],
     dry_run: bool,
 ) -> None:
+    import aiohttp
+
     prepared = REPO_ROOT / "data" / "prepared" / task_id
     test_path = prepared / "test.jsonl"
     few_shot_path = prepared / "few_shot_5.jsonl"
@@ -278,76 +220,45 @@ async def run_eval(
         click.echo(f"  SKIP [{model_cfg.model_short}/{task_id}/{condition}]: already exists")
         return
 
-    # For adapter conditions, verify adapter exists
     model_name = "adapter" if adapter_path and adapter_path.exists() else model_cfg.model_id
-
     semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
 
-    # Load MBPP test lists if needed
-    mbpp_tests: dict[str, list[str]] = {}
-    if task_id == "mbpp":
-        raw_path = REPO_ROOT / "data" / "raw" / "mbpp"
-        if (raw_path / "dataset_dict.json").exists() or raw_path.exists():
-            try:
-                from datasets import load_from_disk
-                ds = load_from_disk(str(raw_path))
-                split = "test" if "test" in ds else list(ds.keys())[0]
-                for i, row in enumerate(ds[split]):
-                    key = f"mbpp_test_{i:04d}"
-                    mbpp_tests[key] = row.get("test_list", [])
-            except Exception:
-                pass
-
-    async def process_row(row: dict) -> dict:
+    async def process_row(row: dict, session: "aiohttp.ClientSession") -> dict:
         msgs = build_messages(row, few_shot, condition)
-        ground_truth = row.get("label", "")
-        row_id = row.get("id", "")
         try:
-            text, in_tok, out_tok, lat, ttft = await call_vllm(
-                model_name, msgs, task_cfg.max_output_tokens, semaphore
+            text, lat, ttft = await call_vllm(
+                session, model_name, msgs, task_cfg.max_output_tokens, semaphore
             )
         except Exception as exc:
-            text, in_tok, out_tok, lat, ttft = f"ERROR: {exc}", 0, 0, 0, 0
-
-        result: dict = {
-            "id": row_id,
+            text, lat, ttft = f"ERROR: {exc}", 0.0, 0.0
+        return {
+            "id": row.get("id", ""),
             "model": model_cfg.model_short,
             "condition": condition,
             "input": msgs[-1]["content"] if msgs else "",
             "output": text,
-            "ground_truth": ground_truth,
-            "input_tokens": in_tok,
-            "output_tokens": out_tok,
+            "ground_truth": row.get("label", ""),
+            "input_tokens": 0,
+            "output_tokens": 0,
             "latency_ms": lat,
             "ttft_ms": ttft,
             "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
 
-        # MBPP: run tests
-        if task_id == "mbpp" and not text.startswith("ERROR:"):
-            code = extract_code(text)
-            tests = mbpp_tests.get(row_id, [])
-            if tests:
-                passed, err = run_mbpp_tests(code, tests)
-                result["mbpp_passed"] = passed
-                result["mbpp_error"] = err
-            else:
-                result["mbpp_passed"] = None
-                result["mbpp_error"] = "no tests found"
-
-        return result
-
     click.echo(f"  Evaluating {model_cfg.model_short}/{task_id}/{condition} ({len(test_rows)} examples)...")
-    tasks_list = [process_row(r) for r in test_rows]
     from tqdm.asyncio import tqdm
-    predictions = await tqdm.gather(*tasks_list, desc=f"{model_cfg.model_short}/{task_id}")
+    async with aiohttp.ClientSession() as session:
+        predictions = await tqdm.gather(
+            *[process_row(r, session) for r in test_rows],
+            desc=f"{model_cfg.model_short}/{task_id}",
+        )
 
     write_jsonl(predictions, out_path)
     click.echo(f"  Saved {len(predictions)} predictions to {out_path.relative_to(REPO_ROOT)}")
 
 
 @click.command()
-@click.option("--model", required=True, help="Model ID (qwen3-8b|gemma3-4b|phi4-mini)")
+@click.option("--model", default="qwen3-8b", help="Model ID or 'all'")
 @click.option("--task", default="all", help="Task ID or 'all'")
 @click.option("--condition", default="all", help="zero-shot|5-shot|lora-500|lora-full|all")
 @click.option("--dry-run", is_flag=True, help="Validate without running inference")
@@ -379,13 +290,17 @@ def main(model: str, task: str, condition: str, dry_run: bool) -> None:
                 failures.append((f"{mid}/{tid}", str(exc)))
                 continue
 
+            seq_len = task_cfg.max_seq_length or model_cfg.max_seq_length
+
             # --- Base model (zero-shot, 5-shot) ---
             if base_conditions:
                 if dry_run:
                     for cond in base_conditions:
                         asyncio.run(run_eval(model_cfg, tid, cond, task_cfg, None, dry_run=True))
                 else:
-                    proc = start_vllm_server(model_cfg.model_id, None, model_cfg.max_seq_length)
+                    proc = start_vllm_server(
+                        model_cfg.model_id, None, seq_len, model_cfg.enable_thinking
+                    )
                     try:
                         ready = asyncio.run(wait_for_vllm())
                         if not ready:
@@ -412,7 +327,9 @@ def main(model: str, task: str, condition: str, dry_run: bool) -> None:
                     asyncio.run(run_eval(model_cfg, tid, cond, task_cfg, adapter_path, dry_run=True))
                     continue
 
-                proc = start_vllm_server(model_cfg.model_id, adapter_path, model_cfg.max_seq_length)
+                proc = start_vllm_server(
+                    model_cfg.model_id, adapter_path, seq_len, model_cfg.enable_thinking
+                )
                 try:
                     ready = asyncio.run(wait_for_vllm())
                     if not ready:

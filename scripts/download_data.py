@@ -12,12 +12,12 @@ import yaml
 
 # Expected minimum row counts for sanity checks (split: min_count)
 EXPECTED_COUNTS: dict[str, dict[str, int]] = {
-    "ledgar":    {"train": 50000, "test": 5000, "validation": 5000},
+    "banking77": {"train": 8000,  "test": 2000},
     "cuad":      {"train": 100},
-    "banking77": {"train": 8000, "test": 2000},
-    "fpb":       {"train": 2000},
-    "medmcqa":   {"train": 100000, "validation": 3000},
-    "mbpp":      {"train": 300, "test": 400},
+    "ledgar":    {"train": 50000, "test": 5000},
+    "fpb":       {"train": 3000},
+    "medmcqa":   {"train": 100000, "test": 4000},
+    "mbpp":      {"train": 374,   "test": 500},
 }
 
 REPO_ROOT = Path(__file__).parent.parent
@@ -41,14 +41,20 @@ def load_task_configs(task_ids: list[str]) -> list[TaskConfig]:
     return configs
 
 
-ALL_TASKS = ["ledgar", "cuad", "banking77", "fpb", "medmcqa", "mbpp"]
+ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa", "mbpp"]
 
 
 @click.command()
-@click.option("--task", default="all", help="Task ID or 'all'")
+@click.option("--task", default=None, help="Task ID to download (required; use 'all' to download every task)")
 @click.option("--dry-run", is_flag=True, help="Validate config without downloading")
 def main(task: str, dry_run: bool) -> None:
-    """Download benchmark datasets from HuggingFace."""
+    """Download benchmark datasets from HuggingFace.
+
+    You must specify --task <id> or --task all. No default — downloading all
+    six datasets at once can take significant time and disk space.
+    """
+    if task is None:
+        raise click.UsageError("--task is required. Pass a task ID or 'all' to download every task.")
     task_ids = ALL_TASKS if task == "all" else [task]
     configs = load_task_configs(task_ids)
 

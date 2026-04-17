@@ -1,61 +1,137 @@
 # Baseweight Benchmark
 
-Fine-tuned open-source models vs. frontier APIs on vertical SaaS tasks.
-
-Six tasks. Three fine-tuned models. Five frontier APIs. Full cost analysis.
+A configurable pipeline for comparing QLoRA fine-tuned open-source models against frontier API models on various tasks. Measures accuracy, latency, cost per query, and 12-month TCO under training-data-constrained conditions (zero-shot, 5-shot, and LoRA fine-tuned on 500 or full examples).
 
 **Results:** [baseweight.co/benchmark](https://baseweight.co/benchmark)
 **Methodology:** [baseweight.co/methodology](https://baseweight.co/methodology)
-**Weights:** [HuggingFace collection](https://huggingface.co/collections/baseweight/baseweight-benchmark)
 
-## What this is
+## What this benchmarks
 
-A reproducible benchmark comparing QLoRA-fine-tuned open-source models (Qwen3-8B, Gemma 3-4B, Phi-4-mini) against frontier APIs (GPT-4.1, Claude Sonnet 4.6, Gemini 2.5 Flash) on six production tasks: legal document classification, contract clause extraction, customer support routing, financial sentiment, medical QA, and code generation.
+**Open-source models** (QLoRA fine-tuned via Unsloth + vLLM):
 
-Every result includes accuracy, cost per correct prediction, latency, and an error analysis.
+| Model | Parameter count |
+|-------|----------------|
+| Qwen3-8B | 8B |
+| Gemma 3 4B | 4B |
+| Phi-4 Mini | 3.8B |
 
-## Reproduce
+**Frontier API models** (zero-shot and 5-shot):
 
-Requires: NVIDIA A100 80GB GPU, Python 3.11+, API keys for OpenAI/Anthropic/Google. Total cost: ~$300.
+| Model | Provider |
+|-------|----------|
+| GPT-5.4 | OpenAI |
+| GPT-4.1, 4.1 Mini, 4.1 Nano | OpenAI |
+| GPT-4.1 SFT-500 | OpenAI (API fine-tuned) |
+| Claude Sonnet 4 | Anthropic |
+| Gemini 2.5 Flash | Google |
+
+**Tasks and metrics:**
+
+| Task | Dataset | Type | Metric |
+|------|---------|------|--------|
+| Customer support routing | BANKING77 | Classification | Weighted F1 |
+| Contract clause extraction | CUAD | Extraction | Token F1 |
+| Legal document classification | LEDGAR | Classification | Macro F1 |
+| Financial sentiment | FPB | Classification | Macro F1 |
+| Medical QA | MedMCQA | Classification | Accuracy |
+| Code generation | MBPP | Code | Pass@1 |
+
+**Conditions per model:**
+
+| Condition | Description |
+|-----------|-------------|
+| `zero-shot` | System + user prompt, no examples |
+| `5-shot` | 5 in-context examples |
+| `lora-500` | QLoRA fine-tuned on 500 training examples |
+| `lora-full` | QLoRA fine-tuned on full training set |
+| `api-sft-500` | OpenAI SFT API fine-tuned on 500 examples |
+
+## Repository layout
+
+```
+configs/         Task and model YAML configs, pricing
+data/            Raw and prepared datasets (gitignored)
+prompts/         Per-task prompt templates
+results/         Predictions, classified outputs, summaries (gitignored)
+scripts/         Pipeline scripts
+site/            Static dashboard (Chart.js)
+```
+
+## Quick start
 
 ```bash
 git clone https://github.com/baseweight/baseweight-benchmark.git
 cd baseweight-benchmark
-bash scripts/setup.sh
-cp .env.example .env  # add API keys
-python scripts/download_data.py
-python scripts/prepare_datasets.py
+pip install -r requirements.txt
+cp .env.example .env  # add OPENAI_API_KEY, ANTHROPIC_API_KEY, GOOGLE_API_KEY, HF_TOKEN
 ```
 
-### Train
+### 1. Download and prepare a task
 
 ```bash
-python scripts/train.py --model qwen3-8b --task all
-python scripts/train.py --model gemma3-4b --task all
-python scripts/train.py --model phi4-mini --task all
-python scripts/train.py --model qwen3-8b --task all --efficiency-curve
+python scripts/download_data.py --task banking77
+python scripts/prepare_datasets.py --task banking77
 ```
 
-### Evaluate
+Pass `--task all` to operate on all six tasks. Both scripts require an explicit `--task` argument — they will not run all tasks by default.
+
+### 2. Fine-tune an open-source model
 
 ```bash
-python scripts/eval_local.py --task all
-python scripts/eval_api.py --task all
-python scripts/classify_errors.py
+# Train on 500 examples and full set
+python scripts/train.py --model qwen3-8b --task banking77 --condition all
+
+# With HuggingFace auto-upload (recommended for remote GPU persistence)
+python scripts/train.py --model qwen3-8b --task banking77 --condition all --auto-upload
+```
+
+### 3. Evaluate
+
+```bash
+# Local model via vLLM
+python scripts/eval_local.py --model qwen3-8b --task banking77 --condition all
+
+# Frontier API models
+python scripts/eval_api.py --model gpt-4.1 --task banking77 --condition all
+python scripts/eval_api.py --model claude-sonnet-4 --task banking77
+python scripts/eval_api.py --model gpt-4.1-sft --task banking77  # triggers SFT job
+```
+
+### 4. Classify errors and compute metrics
+
+```bash
+python scripts/classify_errors.py --task banking77
+```
+
+### 5. Generate dashboard data
+
+```bash
 python scripts/generate_dashboard_data.py
 ```
 
-## Tasks
+## Configuring your own run
 
-| Task | Dataset | Metric |
-|------|---------|--------|
-| Legal document classification | LEDGAR (LexGLUE) | Weighted F1 |
-| Contract clause extraction | CUAD | Token F1 |
-| Customer support routing | BANKING77 | Weighted F1 |
-| Financial sentiment | FinancialPhraseBank | Weighted F1 |
-| Medical QA | MedMCQA | Accuracy |
-| Code generation | MBPP | Pass@1 |
+Each task has a YAML in `configs/tasks/<task_id>.yaml`. Key fields:
+
+- `metric_id`: which metric to compute (`weighted_f1`, `macro_f1`, `accuracy`, `token_f1`, `pass_at_1`)
+- `max_seq_length`: overrides the model's default for that task
+- `training_cap`: caps the full training set size
+- `test_sample_size`: caps test set for faster evaluation
+
+Model training configs live in `configs/training/<model_id>.yaml` and control LoRA hyperparameters, sequence length, and `enable_thinking` for Qwen3.
+
+API pricing is in `configs/pricing.yaml` and feeds cost-per-query and TCO calculations in the dashboard.
+
+## Artifact persistence (RunPod / remote GPU)
+
+```bash
+# Sync everything to HuggingFace (safe to run any time)
+python scripts/sync_artifacts.py --what all
+
+# Download adapters and predictions on a new pod
+python scripts/sync_artifacts.py --what adapters --direction down
+```
 
 ## License
 
-Code: MIT. Model adapters: inherit base model license. Datasets: see individual licenses.
+Code: MIT. Model adapters follow each model's original license. Datasets: see individual dataset cards on HuggingFace.
