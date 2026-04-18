@@ -1,0 +1,308 @@
+"""Unit tests for classify_errors.py."""
+import pytest
+
+from classify_errors import (
+    classify_classification,
+    classify_code,
+    classify_extraction,
+    classify_predictions,
+    compute_metric,
+    get_valid_labels,
+    is_empty,
+    is_format_violation,
+    is_refusal,
+    normalize_text,
+    token_f1,
+)
+
+pytestmark = pytest.mark.unit
+
+
+# ── normalize_text ─────────────────────────────────────────────────────────────
+
+def test_normalize_text_lowercases():
+    assert normalize_text("POSITIVE") == "positive"
+
+
+def test_normalize_text_strips_punctuation():
+    assert normalize_text("hello, world!") == "hello world"
+
+
+def test_normalize_text_collapses_whitespace():
+    assert normalize_text("  a   b  ") == "a b"
+
+
+def test_normalize_text_empty():
+    assert normalize_text("") == ""
+
+
+# ── token_f1 ───────────────────────────────────────────────────────────────────
+
+def test_token_f1_perfect_match():
+    assert token_f1("the quick brown fox", "the quick brown fox") == pytest.approx(1.0)
+
+
+def test_token_f1_empty_both():
+    assert token_f1("", "") == pytest.approx(1.0)
+
+
+def test_token_f1_empty_pred():
+    assert token_f1("", "answer") == pytest.approx(0.0)
+
+
+def test_token_f1_empty_gold():
+    assert token_f1("answer", "") == pytest.approx(0.0)
+
+
+def test_token_f1_partial_overlap():
+    score = token_f1("the quick fox", "the quick brown fox")
+    assert 0.0 < score < 1.0
+
+
+def test_token_f1_no_overlap():
+    assert token_f1("cat", "dog") == pytest.approx(0.0)
+
+
+def test_token_f1_duplicate_tokens():
+    # "a a" vs "a" — precision=0.5, recall=1.0 → F1=2/3
+    score = token_f1("a a", "a")
+    assert score == pytest.approx(2 / 3, rel=1e-3)
+
+
+# ── is_empty / is_refusal / is_format_violation ───────────────────────────────
+
+def test_is_empty_whitespace():
+    assert is_empty("   ")
+    assert is_empty("")
+
+
+def test_is_empty_nonempty():
+    assert not is_empty("positive")
+
+
+@pytest.mark.parametrize("text", [
+    "I cannot provide that information.",
+    "I can't help with this.",
+    "I'm not able to do that.",
+    "I am not able to assist.",
+    "I'm unable to answer.",
+    "I am unable to help.",
+    "I won't do that.",
+    "I will not answer.",
+    "I refuse to comply.",
+    "As an AI, I...",
+    "I don't feel comfortable with this.",
+    "I'm sorry, but I cannot answer.",
+    "Sorry, I cannot do that.",
+])
+def test_is_refusal_detected(text):
+    assert is_refusal(text)
+
+
+def test_is_refusal_normal_output():
+    assert not is_refusal("positive")
+    assert not is_refusal("The answer is negative.")
+
+
+def test_is_format_violation_not_in_labels():
+    assert is_format_violation("maybe", ["positive", "negative", "neutral"])
+
+
+def test_is_format_violation_valid_label():
+    assert not is_format_violation("positive", ["positive", "negative", "neutral"])
+
+
+def test_is_format_violation_case_insensitive():
+    assert not is_format_violation("POSITIVE", ["positive", "negative", "neutral"])
+
+
+def test_is_format_violation_no_labels():
+    assert not is_format_violation("anything goes", None)
+
+
+# ── classify_classification ────────────────────────────────────────────────────
+
+def test_classify_classification_correct():
+    assert classify_classification("positive", "positive") == "correct"
+
+
+def test_classify_classification_wrong_class():
+    assert classify_classification("negative", "positive") == "wrong_class"
+
+
+def test_classify_classification_empty():
+    assert classify_classification("", "positive") == "empty"
+
+
+def test_classify_classification_refusal():
+    assert classify_classification("I cannot answer this", "positive") == "refusal"
+
+
+def test_classify_classification_format_violation():
+    result = classify_classification("sure thing", "positive", ["positive", "negative", "neutral"])
+    assert result == "format_violation"
+
+
+def test_classify_classification_priority_empty_beats_refusal():
+    assert classify_classification("", "positive", ["positive"]) == "empty"
+
+
+# ── classify_extraction ────────────────────────────────────────────────────────
+
+def test_classify_extraction_correct():
+    gt = "The contract expires on January 1, 2025"
+    assert classify_extraction(gt, gt) == "correct"
+
+
+def test_classify_extraction_empty():
+    assert classify_extraction("", "some answer") == "empty"
+
+
+def test_classify_extraction_partial():
+    pred = "The contract"
+    gt = "The contract expires on January 1, 2025"
+    result = classify_extraction(pred, gt)
+    assert result in ("partial", "hallucinated")
+
+
+@pytest.mark.parametrize("pred,gt", [
+    ("Not found.", "Not found."),
+    ("No answer.", "Not found."),
+    ("None", "Not found."),
+    ("not applicable", "not mentioned"),
+    ("not mentioned", "not found"),
+])
+def test_classify_extraction_not_applicable_variants(pred, gt):
+    assert classify_extraction(pred, gt) == "not_applicable"
+
+
+def test_classify_extraction_hallucinated_gt_not_found():
+    result = classify_extraction("The date is January 2025", "Not found.")
+    assert result == "hallucinated"
+
+
+def test_classify_extraction_format_violation_too_long():
+    # Prediction much longer than ground truth → format_violation
+    gt = "yes"
+    pred = " ".join(["word"] * 200)
+    result = classify_extraction(pred, gt)
+    assert result == "format_violation"
+
+
+# ── classify_code ─────────────────────────────────────────────────────────────
+
+def test_classify_code_pass():
+    assert classify_code("def foo(): pass", "def foo(): pass", mbpp_passed=True) == "pass"
+
+
+def test_classify_code_syntax_error():
+    result = classify_code("def foo(:\n    pass", "def foo(): pass", mbpp_passed=False)
+    assert result == "syntax_error"
+
+
+def test_classify_code_runtime_error():
+    result = classify_code(
+        "def foo(): return x",
+        "def foo(): return 1",
+        mbpp_passed=False,
+        mbpp_error="NameError: x not defined",
+    )
+    assert result == "runtime_error"
+
+
+def test_classify_code_logic_error():
+    result = classify_code("def foo(): return 42", "def foo(): return 1", mbpp_passed=False)
+    assert result == "logic_error"
+
+
+def test_classify_code_incomplete_empty():
+    assert classify_code("", "def foo(): pass", mbpp_passed=False) == "incomplete"
+
+
+def test_classify_code_strips_fences():
+    code = "```python\ndef foo(): pass\n```"
+    result = classify_code(code, "", mbpp_passed=True)
+    assert result == "pass"
+
+
+# ── compute_metric ─────────────────────────────────────────────────────────────
+
+def _make_task_cfg(task_type: str, metric_id: str):
+    from classify_errors import TaskConfig
+    return TaskConfig(task_id="toy", task_type=task_type, metric_id=metric_id)
+
+
+def test_compute_metric_accuracy():
+    cfg = _make_task_cfg("classification", "accuracy")
+    rows = [
+        {"error_category": "correct"},
+        {"error_category": "correct"},
+        {"error_category": "wrong_class"},
+        {"error_category": "correct"},
+    ]
+    assert compute_metric(cfg, rows) == pytest.approx(0.75)
+
+
+def test_compute_metric_token_f1():
+    cfg = _make_task_cfg("extraction", "token_f1")
+    rows = [{"token_f1": 1.0}, {"token_f1": 0.5}, {"token_f1": 0.0}]
+    assert compute_metric(cfg, rows) == pytest.approx(0.5)
+
+
+def test_compute_metric_pass_at_1():
+    cfg = _make_task_cfg("code", "pass_at_1")
+    rows = [{"error_category": "pass"}, {"error_category": "syntax_error"}, {"error_category": "pass"}]
+    assert compute_metric(cfg, rows) == pytest.approx(2 / 3)
+
+
+def test_compute_metric_empty_rows():
+    cfg = _make_task_cfg("classification", "accuracy")
+    assert compute_metric(cfg, []) == pytest.approx(0.0)
+
+
+# ── classify_predictions (full pipeline) ──────────────────────────────────────
+
+def test_classify_predictions_classification(toy_predictions):
+    cfg = _make_task_cfg("classification", "accuracy")
+    classified, counts = classify_predictions(toy_predictions, cfg, ["positive", "negative", "neutral"])
+    assert len(classified) == len(toy_predictions)
+    assert "correct" in counts or "wrong_class" in counts
+    assert all("error_category" in r for r in classified)
+    assert all("predicted_clean" in r for r in classified)
+
+
+def test_classify_predictions_sums_to_n(toy_predictions):
+    cfg = _make_task_cfg("classification", "accuracy")
+    _, counts = classify_predictions(toy_predictions, cfg)
+    assert sum(counts.values()) == len(toy_predictions)
+
+
+def test_classify_predictions_extraction():
+    cfg = _make_task_cfg("extraction", "token_f1")
+    rows = [
+        {"id": "e1", "output": "The answer is yes", "ground_truth": "The answer is yes", "latency_ms": 100},
+        {"id": "e2", "output": "", "ground_truth": "something", "latency_ms": 100},
+    ]
+    classified, counts = classify_predictions(rows, cfg)
+    assert classified[0]["error_category"] == "correct"
+    assert classified[1]["error_category"] == "empty"
+
+
+# ── get_valid_labels ───────────────────────────────────────────────────────────
+
+def test_get_valid_labels_fpb():
+    labels = get_valid_labels("fpb")
+    assert set(labels) == {"positive", "negative", "neutral"}
+
+
+def test_get_valid_labels_medmcqa():
+    labels = get_valid_labels("medmcqa")
+    assert set(labels) == {"A", "B", "C", "D"}
+
+
+def test_get_valid_labels_banking77_none():
+    assert get_valid_labels("banking77") is None
+
+
+def test_get_valid_labels_cuad_none():
+    assert get_valid_labels("cuad") is None

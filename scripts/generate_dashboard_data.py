@@ -13,6 +13,14 @@ from pydantic import BaseModel, Field
 REPO_ROOT = Path(__file__).parent.parent
 ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa", "mbpp"]
 
+CONDITION_LABELS: dict[str, str] = {
+    "zero-shot": "Zero-shot",
+    "5-shot": "5-shot",
+    "lora-500": "LoRA-500",
+    "lora-full": "LoRA-Full",
+    "api-sft-500": "SFT-500",
+}
+
 # Model display names and families
 MODEL_META = {
     # open-source (QLoRA fine-tuned)
@@ -195,6 +203,32 @@ def build_result(
     }
 
 
+def build_tasks_dict(flat_results: list[dict]) -> dict[str, dict]:
+    """Reshape flat results into per-task dicts consumed by benchmark.html."""
+    from collections import defaultdict
+
+    # Load metric labels from the authoritative task configs.
+    task_metric_labels: dict[str, str] = {}
+    for task_id in ALL_TASKS:
+        task_path = REPO_ROOT / "configs" / "tasks" / f"{task_id}.yaml"
+        with open(task_path) as f:
+            task_metric_labels[task_id] = yaml.safe_load(f).get("metric_label", "Metric")
+
+    groups: dict[str, list[dict]] = defaultdict(list)
+    for r in flat_results:
+        groups[r["task_id"]].append({
+            **r,
+            "model_label": r["display_name"],
+            "condition_label": CONDITION_LABELS.get(r["condition"], r["condition"]),
+            "model_family": r["family"],
+        })
+
+    return {
+        task_id: {"metric_label": task_metric_labels[task_id], "results": groups[task_id]}
+        for task_id in ALL_TASKS
+    }
+
+
 def build_efficiency_points(task_id: str) -> list[dict]:
     """Build efficiency curve data for qwen3-8b (all efficiency sizes)."""
     points = []
@@ -280,11 +314,22 @@ def build_dashboard_data(daily_volume: int = 10000) -> dict:
         },
     }
 
+    # Training cost is per (model, condition), not per task — deduplicate before summing.
+    seen_training: set[tuple] = set()
+    total_cost = 0.0
+    for r in results:
+        key = (r["model_id"], r["condition"])
+        if key not in seen_training:
+            seen_training.add(key)
+            total_cost += r["training_cost"] or 0
+
     return {
         "generated_at": None,  # filled at write time
         "daily_volume_assumption": daily_volume,
+        "meta": {"total_cost": round(total_cost, 2)},
         "headline_stats": headline_stats,
         "results": results,
+        "tasks": build_tasks_dict(results),
         "efficiency_data": efficiency_data,
     }
 

@@ -329,10 +329,10 @@ def process_model_task_condition(
 
     summary_path = REPO_ROOT / "results" / "summaries" / model_short / task_id / f"{condition}.json"
     write_json(summary, summary_path)
+    metric_str = f"{metric_value:.4f}" if metric_value is not None else "N/A"
     click.echo(
         f"  [{model_short}/{task_id}/{condition}] "
-        f"{task_cfg.metric_id}={metric_value:.4f if metric_value is not None else 'N/A'} "
-        f"counts={counts}"
+        f"{task_cfg.metric_id}={metric_str} counts={counts}"
     )
     return summary
 
