@@ -1,0 +1,28 @@
+model_id: Qwen/Qwen2.5-0.5B-Instruct
+model_short: tiny
+max_seq_length: 256
+load_in_4bit: false
+dtype: float32
+enable_thinking: null
+fallback_model_id: null
+lora:
+  rank: 4
+  alpha: 8
+  dropout: 0.0
+  use_rslora: false
+training:
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 1
+  learning_rate: 2e-4
+  lr_scheduler_type: constant
+  warmup_ratio: 0.0
+  weight_decay: 0.01
+  optim: adamw_torch
+  bf16: false
+  fp16: false
+  seed: 42
+  save_strategy: "no"
+  eval_strategy: "no"
+  load_best_model_at_end: false
+  logging_steps: 1
+  report_to: none

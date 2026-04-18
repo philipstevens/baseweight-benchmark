@@ -187,6 +187,97 @@ async def call_vllm(
     return "", 0.0, 0.0
 
 
+def run_eval_tiny_sync(
+    model_cfg: ModelConfig,
+    task_id: str,
+    condition: str,
+    task_cfg: TaskConfig,
+    adapter_path: Optional[Path],
+) -> None:
+    """CPU inference via transformers pipeline — no vLLM or GPU required."""
+    import time
+    import torch
+    from datetime import datetime, timezone
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import pipeline as hf_pipeline
+    from peft import PeftModel
+
+    prepared = REPO_ROOT / "data" / "prepared" / task_id
+    test_path = prepared / "test.jsonl"
+    few_shot_path = prepared / "few_shot_5.jsonl"
+
+    if not test_path.exists():
+        click.echo(f"  SKIP [{model_cfg.model_short}/{task_id}/{condition}]: test.jsonl not found")
+        return
+
+    test_rows = load_jsonl(test_path)
+    few_shot = load_jsonl(few_shot_path) if few_shot_path.exists() else []
+
+    out_path = (
+        REPO_ROOT / "results" / "predictions"
+        / model_cfg.model_short / task_id / f"{condition}.jsonl"
+    )
+
+    if out_path.exists():
+        click.echo(f"  SKIP [{model_cfg.model_short}/{task_id}/{condition}]: already exists")
+        return
+
+    pp = partial_path(out_path)
+    completed_ids = load_partial_ids(pp)
+    pending_rows = [r for r in test_rows if r.get("id", "") not in completed_ids]
+
+    if not pending_rows:
+        finalize_partial(pp, out_path)
+        return
+
+    click.echo(f"  [tiny] Loading {model_cfg.model_id} on CPU...")
+    base = AutoModelForCausalLM.from_pretrained(model_cfg.model_id, torch_dtype=torch.float32)
+    tok = AutoTokenizer.from_pretrained(model_cfg.model_id)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+
+    if adapter_path and adapter_path.exists():
+        click.echo(f"  [tiny] Applying LoRA adapter from {adapter_path.name}/")
+        base = PeftModel.from_pretrained(base, str(adapter_path))
+
+    pipe = hf_pipeline(
+        "text-generation",
+        model=base,
+        tokenizer=tok,
+        max_new_tokens=task_cfg.max_output_tokens,
+        do_sample=False,
+        temperature=None,
+        pad_token_id=tok.eos_token_id,
+    )
+
+    click.echo(f"  [tiny] Evaluating {len(pending_rows)} rows on CPU (no vLLM)...")
+    for row in pending_rows:
+        msgs = build_messages(row, few_shot, condition)
+        t0 = time.time()
+        result = pipe(msgs)
+        lat = (time.time() - t0) * 1000
+        generated = result[0]["generated_text"]
+        # Chat pipeline returns full conversation; last entry is the assistant turn
+        output = generated[-1]["content"] if isinstance(generated, list) else str(generated)
+        rec = {
+            "id": row.get("id", ""),
+            "model": model_cfg.model_short,
+            "condition": condition,
+            "input": msgs[-1]["content"] if msgs else "",
+            "output": output,
+            "ground_truth": row.get("label", ""),
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "latency_ms": round(lat, 1),
+            "ttft_ms": 0.0,
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        }
+        append_jsonl(rec, pp)
+
+    finalize_partial(pp, out_path)
+    click.echo(f"  Saved {len(test_rows)} predictions to {out_path.relative_to(REPO_ROOT)}")
+
+
 async def run_eval(
     model_cfg: ModelConfig,
     task_id: str,
@@ -276,8 +367,11 @@ async def run_eval(
 @click.option("--task", default="all", help="Task ID or 'all'")
 @click.option("--condition", default="all", help="zero-shot|5-shot|lora-500|lora-full|all")
 @click.option("--dry-run", is_flag=True, help="Validate without running inference")
-def main(model: str, task: str, condition: str, dry_run: bool) -> None:
+@click.option("--tiny", is_flag=True, help="CPU test mode: Qwen2.5-0.5B via transformers, no vLLM or GPU")
+def main(model: str, task: str, condition: str, dry_run: bool, tiny: bool) -> None:
     """Evaluate local fine-tuned models via vLLM server."""
+    if tiny and model in ALL_MODELS + ["all"]:
+        model = "tiny"  # use CPU-safe config automatically
     model_ids = ALL_MODELS if model == "all" else [model]
     task_ids = ALL_TASKS if task == "all" else [task]
 
@@ -305,6 +399,25 @@ def main(model: str, task: str, condition: str, dry_run: bool) -> None:
                 continue
 
             seq_len = task_cfg.max_seq_length or model_cfg.max_seq_length
+
+            if tiny:
+                # CPU path: direct transformers inference, no vLLM server.
+                for cond in conditions:
+                    if dry_run:
+                        asyncio.run(run_eval(model_cfg, tid, cond, task_cfg, None, dry_run=True))
+                        continue
+                    adapter_path = None
+                    if cond.startswith("lora-"):
+                        adapter_path = REPO_ROOT / "results" / "adapters" / model_cfg.model_short / tid / cond
+                        if not adapter_path.exists():
+                            click.echo(f"  SKIP [{mid}/{tid}/{cond}]: adapter not found at {adapter_path}")
+                            continue
+                    try:
+                        run_eval_tiny_sync(model_cfg, tid, cond, task_cfg, adapter_path)
+                    except Exception as exc:
+                        click.echo(f"  ERROR [{mid}/{tid}/{cond}]: {exc}", err=True)
+                        failures.append((f"{mid}/{tid}/{cond}", str(exc)))
+                continue  # skip the vLLM block below
 
             # --- Base model (zero-shot, 5-shot) ---
             if base_conditions:

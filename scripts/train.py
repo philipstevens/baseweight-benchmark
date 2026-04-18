@@ -81,6 +81,7 @@ def train_one(
     data_path: Path,
     dry_run: bool,
     auto_upload: bool = False,
+    tiny: bool = False,
 ) -> dict:
     """Train a single model/task/condition. Returns metadata dict."""
     task_id = task_cfg.task_id
@@ -127,46 +128,70 @@ def train_one(
         "global_step": 0,
     })
 
-    try:
-        from unsloth import FastModel
-        model_id = model_cfg.model_id
-        substituted = False
-    except ImportError:
-        raise RuntimeError("Unsloth not installed. Run: pip install 'unsloth[cu124-torch260]'")
+    lora_cfg = model_cfg.lora
+    model_id = model_cfg.model_id
+    substituted = False
 
-    try:
-        model, tokenizer = FastModel.from_pretrained(
-            model_name=model_id,
-            max_seq_length=seq_len,
-            load_in_4bit=model_cfg.load_in_4bit,
-            dtype=None,
+    if tiny:
+        # CPU path: standard transformers + PEFT, no Unsloth or GPU required.
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from peft import LoraConfig, get_peft_model, TaskType
+
+        click.echo(f"  [tiny] Loading {model_id} on CPU (float32, no quantization)...")
+        model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float32)
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        peft_config = LoraConfig(
+            r=lora_cfg.get("rank", 4),
+            lora_alpha=lora_cfg.get("alpha", 8),
+            lora_dropout=lora_cfg.get("dropout", 0.0),
+            bias="none",
+            task_type=TaskType.CAUSAL_LM,
         )
-    except Exception as exc:
-        if model_cfg.fallback_model_id:
-            click.echo(f"  WARNING: {model_id} failed ({exc}). Falling back to {model_cfg.fallback_model_id}")
-            model_id = model_cfg.fallback_model_id
-            substituted = True
+        model = get_peft_model(model, peft_config)
+        model.print_trainable_parameters()
+    else:
+        # GPU path: Unsloth + 4-bit quantization.
+        try:
+            from unsloth import FastModel
+        except ImportError:
+            raise RuntimeError("Unsloth not installed. Run: pip install 'unsloth[cu124-torch260]'")
+
+        try:
             model, tokenizer = FastModel.from_pretrained(
                 model_name=model_id,
                 max_seq_length=seq_len,
                 load_in_4bit=model_cfg.load_in_4bit,
                 dtype=None,
             )
-        else:
-            raise
+        except Exception as exc:
+            if model_cfg.fallback_model_id:
+                click.echo(f"  WARNING: {model_id} failed ({exc}). Falling back to {model_cfg.fallback_model_id}")
+                model_id = model_cfg.fallback_model_id
+                substituted = True
+                model, tokenizer = FastModel.from_pretrained(
+                    model_name=model_id,
+                    max_seq_length=seq_len,
+                    load_in_4bit=model_cfg.load_in_4bit,
+                    dtype=None,
+                )
+            else:
+                raise
 
-    lora_cfg = model_cfg.lora
-    model = FastModel.get_peft_model(
-        model,
-        finetune_language_layers=True,
-        finetune_attention_modules=True,
-        finetune_mlp_modules=True,
-        r=lora_cfg.get("rank", 32),
-        lora_alpha=lora_cfg.get("alpha", 64),
-        lora_dropout=lora_cfg.get("dropout", 0.05),
-        bias="none",
-        use_rslora=lora_cfg.get("use_rslora", True),
-    )
+        model = FastModel.get_peft_model(
+            model,
+            finetune_language_layers=True,
+            finetune_attention_modules=True,
+            finetune_mlp_modules=True,
+            r=lora_cfg.get("rank", 32),
+            lora_alpha=lora_cfg.get("alpha", 64),
+            lora_dropout=lora_cfg.get("dropout", 0.05),
+            bias="none",
+            use_rslora=lora_cfg.get("use_rslora", True),
+        )
 
     from trl import SFTTrainer, SFTConfig
     from transformers import TrainerCallback
@@ -203,30 +228,55 @@ def train_one(
         dataset_text_field = "messages"
 
     training_cfg = model_cfg.training
-    sft_config = SFTConfig(
-        output_dir=str(ckpt_dir),  # HF intermediate checkpoints → network volume
-        num_train_epochs=epochs,
-        per_device_train_batch_size=training_cfg.get("per_device_train_batch_size", 4),
-        gradient_accumulation_steps=training_cfg.get("gradient_accumulation_steps", 4),
-        learning_rate=training_cfg.get("learning_rate", 2e-4),
-        lr_scheduler_type=training_cfg.get("lr_scheduler_type", "cosine"),
-        warmup_ratio=training_cfg.get("warmup_ratio", 0.05),
-        weight_decay=training_cfg.get("weight_decay", 0.01),
-        optim=training_cfg.get("optim", "adamw_8bit"),
-        max_grad_norm=training_cfg.get("max_grad_norm", 1.0),
-        bf16=training_cfg.get("bf16", True),
-        seed=training_cfg.get("seed", 42),
-        save_strategy=training_cfg.get("save_strategy", "epoch"),
-        eval_strategy=training_cfg.get("eval_strategy", "epoch"),
-        load_best_model_at_end=training_cfg.get("load_best_model_at_end", True),
-        metric_for_best_model=training_cfg.get("metric_for_best_model", "eval_loss"),
-        greater_is_better=training_cfg.get("greater_is_better", False),
-        logging_steps=training_cfg.get("logging_steps", 10),
-        report_to=training_cfg.get("report_to", "none"),
-        max_seq_length=seq_len,
-        dataset_text_field=dataset_text_field,
-        packing=False,
-    )
+    if tiny:
+        sft_config = SFTConfig(
+            output_dir=str(ckpt_dir),
+            num_train_epochs=1,
+            per_device_train_batch_size=1,
+            gradient_accumulation_steps=1,
+            learning_rate=training_cfg.get("learning_rate", 2e-4),
+            lr_scheduler_type="constant",
+            warmup_ratio=0.0,
+            weight_decay=training_cfg.get("weight_decay", 0.01),
+            optim=training_cfg.get("optim", "adamw_torch"),
+            max_grad_norm=1.0,
+            bf16=False,
+            fp16=False,
+            seed=training_cfg.get("seed", 42),
+            save_strategy="no",
+            eval_strategy="no",
+            load_best_model_at_end=False,
+            logging_steps=1,
+            report_to="none",
+            max_seq_length=min(seq_len, 256),
+            dataset_text_field=dataset_text_field,
+            packing=False,
+        )
+    else:
+        sft_config = SFTConfig(
+            output_dir=str(ckpt_dir),  # HF intermediate checkpoints → network volume
+            num_train_epochs=epochs,
+            per_device_train_batch_size=training_cfg.get("per_device_train_batch_size", 4),
+            gradient_accumulation_steps=training_cfg.get("gradient_accumulation_steps", 4),
+            learning_rate=training_cfg.get("learning_rate", 2e-4),
+            lr_scheduler_type=training_cfg.get("lr_scheduler_type", "cosine"),
+            warmup_ratio=training_cfg.get("warmup_ratio", 0.05),
+            weight_decay=training_cfg.get("weight_decay", 0.01),
+            optim=training_cfg.get("optim", "adamw_8bit"),
+            max_grad_norm=training_cfg.get("max_grad_norm", 1.0),
+            bf16=training_cfg.get("bf16", True),
+            seed=training_cfg.get("seed", 42),
+            save_strategy=training_cfg.get("save_strategy", "epoch"),
+            eval_strategy=training_cfg.get("eval_strategy", "epoch"),
+            load_best_model_at_end=training_cfg.get("load_best_model_at_end", True),
+            metric_for_best_model=training_cfg.get("metric_for_best_model", "eval_loss"),
+            greater_is_better=training_cfg.get("greater_is_better", False),
+            logging_steps=training_cfg.get("logging_steps", 10),
+            report_to=training_cfg.get("report_to", "none"),
+            max_seq_length=seq_len,
+            dataset_text_field=dataset_text_field,
+            packing=False,
+        )
 
     trainer = SFTTrainer(
         model=model, tokenizer=tokenizer, train_dataset=train_ds, args=sft_config,
@@ -238,7 +288,7 @@ def train_one(
         resume_from_checkpoint=str(resume_ckpt) if resume_ckpt else None
     )
     elapsed_min = (time.time() - t0) / 60
-    training_cost = (elapsed_min / 60) * GPU_HOURLY
+    training_cost = 0.0 if tiny else (elapsed_min / 60) * GPU_HOURLY
 
     model.save_pretrained(str(adapter_dir))
     tokenizer.save_pretrained(str(adapter_dir))
@@ -298,8 +348,11 @@ def _upload_adapter(model_short: str, task_id: str, condition: str) -> None:
 @click.option("--condition", default="all", help="lora-500|lora-full|all")
 @click.option("--auto-upload", is_flag=True, help="Upload adapter to HuggingFace after each run (persistence)")
 @click.option("--dry-run", is_flag=True, help="Validate configs without training")
-def main(model: str, task: str, condition: str, auto_upload: bool, dry_run: bool) -> None:
+@click.option("--tiny", is_flag=True, help="CPU test mode: Qwen2.5-0.5B via transformers+PEFT, no Unsloth or GPU")
+def main(model: str, task: str, condition: str, auto_upload: bool, dry_run: bool, tiny: bool) -> None:
     """QLoRA fine-tune Qwen3-8B on BANKING77 and CUAD."""
+    if tiny and model in ALL_MODELS + ["all"]:
+        model = "tiny"  # use CPU-safe config automatically
     model_ids = ALL_MODELS if model == "all" else [model]
     task_ids = ALL_TASKS if task == "all" else [task]
     conditions = ["lora-500", "lora-full"] if condition == "all" else [condition]
@@ -318,7 +371,7 @@ def main(model: str, task: str, condition: str, auto_upload: bool, dry_run: bool
                         failures.append((f"{mid}/{tid}/{cond}", "data file missing"))
                     continue
                 try:
-                    train_one(model_cfg, task_cfg, cond, data_file, dry_run, auto_upload=auto_upload)
+                    train_one(model_cfg, task_cfg, cond, data_file, dry_run, auto_upload=auto_upload, tiny=tiny)
                 except Exception as exc:
                     click.echo(f"  ERROR [{mid}/{tid}/{cond}]: {exc}", err=True)
                     failures.append((f"{mid}/{tid}/{cond}", str(exc)))
