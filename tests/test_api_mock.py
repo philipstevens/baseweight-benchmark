@@ -13,28 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-# Inject stub modules before eval_api is imported so its lazy imports work
-# in a minimal local environment (no openai/anthropic installed).
-_STUB_MODULES = {}
-for _name in ("openai", "anthropic", "aiohttp"):
-    if _name not in sys.modules:
-        _STUB_MODULES[_name] = MagicMock()
-        sys.modules[_name] = _STUB_MODULES[_name]
-# Ensure tqdm.asyncio is also available (may not be installed).
-# The real tqdm.asyncio.tqdm.gather accepts a `desc` kwarg; asyncio.gather does not.
-async def _tqdm_gather(*coros, desc=None, **kwargs):
-    return await asyncio.gather(*coros, **kwargs)
-
-if "tqdm" not in sys.modules:
-    _tqdm_stub = MagicMock()
-    _tqdm_stub.asyncio.tqdm.gather = _tqdm_gather
-    sys.modules["tqdm"] = _tqdm_stub
-    sys.modules["tqdm.asyncio"] = _tqdm_stub.asyncio
-else:
-    # tqdm installed — patch only tqdm.asyncio.tqdm.gather to accept desc kwarg
-    import tqdm.asyncio as _tqdm_async
-    _tqdm_async.tqdm.gather = _tqdm_gather  # type: ignore[attr-defined]
-
+import tests._api_stubs  # noqa: F401 — injects openai/anthropic/tqdm stubs
 import eval_api
 from eval_api import TaskConfig, run_eval, run_sft
 

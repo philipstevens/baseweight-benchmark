@@ -19,24 +19,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-# Same stub injection as test_api_mock.py so the smoke pipeline can run
-# without openai/anthropic/tqdm installed.
-async def _tqdm_gather(*coros, desc=None, **kwargs):
-    return await asyncio.gather(*coros, **kwargs)
-
-for _name in ("openai", "anthropic", "aiohttp"):
-    if _name not in sys.modules:
-        sys.modules[_name] = MagicMock()
-
-if "tqdm" not in sys.modules:
-    _tqdm_stub = MagicMock()
-    _tqdm_stub.asyncio.tqdm.gather = _tqdm_gather
-    sys.modules["tqdm"] = _tqdm_stub
-    sys.modules["tqdm.asyncio"] = _tqdm_stub.asyncio
-else:
-    import tqdm.asyncio as _tqdm_async
-    _tqdm_async.tqdm.gather = _tqdm_gather  # type: ignore[attr-defined]
-
+import tests._api_stubs  # noqa: F401 — injects openai/anthropic/tqdm stubs
 import classify_errors
 import eval_api
 import generate_dashboard_data
@@ -95,7 +78,7 @@ def _write_toy_prepared_data(root: Path) -> Path:
 
 
 def _write_toy_task_config(root: Path) -> None:
-    """Copy all task configs into the tmp repo (build_tasks_dict reads all of them)."""
+    """Copy all task configs into the tmp repo (build_efficiency_points reads them)."""
     import shutil
     src_dir = REPO_ROOT / "configs" / "tasks"
     dst = root / "configs" / "tasks"
@@ -226,18 +209,12 @@ def test_smoke_pipeline(tmp_path, monkeypatch):
     assert "results" in data
     assert "generated_at" in data
     assert "headline_stats" in data
-    assert "tasks" in data
-    assert "meta" in data
+    assert "total_cost" in data
+    assert "tasks_won_by_oss" in data
+    assert isinstance(data["total_cost"], (int, float))
+    assert isinstance(data["tasks_won_by_oss"], int)
     assert isinstance(data["results"], list)
     assert len(data["results"]) > 0
-    assert "fpb" in data["tasks"]
-    fpb_task = data["tasks"]["fpb"]
-    assert "metric_label" in fpb_task
-    assert "results" in fpb_task
-    assert len(fpb_task["results"]) > 0
-    assert "model_label" in fpb_task["results"][0]
-    assert "condition_label" in fpb_task["results"][0]
-    assert "model_family" in fpb_task["results"][0]
 
     # The fpb/gpt-4.1/zero-shot result should have our metric value
     matching = [

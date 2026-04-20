@@ -8,18 +8,10 @@ from typing import Optional
 
 import click
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 REPO_ROOT = Path(__file__).parent.parent
 ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa", "mbpp"]
-
-CONDITION_LABELS: dict[str, str] = {
-    "zero-shot": "Zero-shot",
-    "5-shot": "5-shot",
-    "lora-500": "LoRA-500",
-    "lora-full": "LoRA-Full",
-    "api-sft-500": "SFT-500",
-}
 
 # Model display names and families
 MODEL_META = {
@@ -203,32 +195,6 @@ def build_result(
     }
 
 
-def build_tasks_dict(flat_results: list[dict]) -> dict[str, dict]:
-    """Reshape flat results into per-task dicts consumed by benchmark.html."""
-    from collections import defaultdict
-
-    # Load metric labels from the authoritative task configs.
-    task_metric_labels: dict[str, str] = {}
-    for task_id in ALL_TASKS:
-        task_path = REPO_ROOT / "configs" / "tasks" / f"{task_id}.yaml"
-        with open(task_path) as f:
-            task_metric_labels[task_id] = yaml.safe_load(f).get("metric_label", "Metric")
-
-    groups: dict[str, list[dict]] = defaultdict(list)
-    for r in flat_results:
-        groups[r["task_id"]].append({
-            **r,
-            "model_label": r["display_name"],
-            "condition_label": CONDITION_LABELS.get(r["condition"], r["condition"]),
-            "model_family": r["family"],
-        })
-
-    return {
-        task_id: {"metric_label": task_metric_labels[task_id], "results": groups[task_id]}
-        for task_id in ALL_TASKS
-    }
-
-
 def build_efficiency_points(task_id: str) -> list[dict]:
     """Build efficiency curve data for qwen3-8b (all efficiency sizes)."""
     points = []
@@ -252,6 +218,96 @@ def build_efficiency_points(task_id: str) -> list[dict]:
         })
 
     return points
+
+
+def compute_stats(results: list[dict]) -> tuple[dict, int, float]:
+    """Compute headline_stats, tasks_won_by_oss, and total_cost from a results list."""
+    best_oss_per_task: dict[str, float] = {}
+    best_frontier_per_task: dict[str, float] = {}
+
+    best_oss: Optional[dict] = None
+    best_frontier: Optional[dict] = None
+    best_sft: Optional[dict] = None
+
+    seen_training: set[tuple] = set()
+    total_cost = 0.0
+
+    for r in results:
+        key = (r["model_id"], r["condition"])
+        if key not in seen_training:
+            seen_training.add(key)
+            total_cost += r["training_cost"] or 0
+
+        if r["metric_value"] is None:
+            continue
+        mv = r["metric_value"]
+        tid = r["task_id"]
+        if r["family"] == "open-source" and r["condition"] == "lora-500":
+            if best_oss is None or mv > best_oss["metric_value"]:
+                best_oss = r
+            if mv > best_oss_per_task.get(tid, -1):
+                best_oss_per_task[tid] = mv
+        if r["family"] == "frontier" and r["condition"] == "5-shot":
+            if best_frontier is None or mv > best_frontier["metric_value"]:
+                best_frontier = r
+            if mv > best_frontier_per_task.get(tid, -1):
+                best_frontier_per_task[tid] = mv
+        if r["family"] == "api-finetuned":
+            if best_sft is None or mv > best_sft["metric_value"]:
+                best_sft = r
+
+    tasks_won = sum(
+        1 for tid in best_oss_per_task
+        if best_oss_per_task[tid] > best_frontier_per_task.get(tid, -1)
+    )
+
+    headline_stats = {
+        "best_oss_lora500_vs_frontier": {
+            "oss_model": best_oss["display_name"] if best_oss else None,
+            "oss_metric": best_oss["metric_value"] if best_oss else None,
+            "frontier_model": best_frontier["display_name"] if best_frontier else None,
+            "frontier_metric": best_frontier["metric_value"] if best_frontier else None,
+            "delta": round(best_oss["metric_value"] - best_frontier["metric_value"], 4) if best_oss and best_frontier else None,
+        },
+        "oss_cost_reduction": {
+            "oss_cost_per_query": best_oss["cost_per_query"] if best_oss else None,
+            "frontier_cost_per_query": best_frontier["cost_per_query"] if best_frontier else None,
+            "reduction_factor": round((best_frontier["cost_per_query"] or 1) / (best_oss["cost_per_query"] or 1), 1) if best_oss and best_frontier and best_oss["cost_per_query"] else None,
+        },
+        "sft_vs_base": {
+            "sft_model": best_sft["display_name"] if best_sft else None,
+            "sft_metric": best_sft["metric_value"] if best_sft else None,
+        },
+    }
+
+    return headline_stats, tasks_won, round(total_cost, 2)
+
+
+def merge_results(fresh: list[dict], existing_path: Path) -> list[dict]:
+    """Merge fresh results with existing ones.
+
+    For each (model_id, task_id, condition), the fresh value wins if it has
+    metric_value; otherwise the existing non-null value is preserved.
+    """
+    try:
+        with open(existing_path) as f:
+            existing = json.load(f)
+    except Exception:
+        return fresh
+
+    existing_map = {
+        (r["model_id"], r["task_id"], r["condition"]): r
+        for r in existing.get("results", [])
+    }
+    merged = []
+    for r in fresh:
+        key = (r["model_id"], r["task_id"], r["condition"])
+        prior = existing_map.get(key)
+        if r["metric_value"] is None and prior is not None and prior.get("metric_value") is not None:
+            merged.append(prior)
+        else:
+            merged.append(r)
+    return merged
 
 
 def build_dashboard_data(daily_volume: int = 10000) -> dict:
@@ -278,58 +334,15 @@ def build_dashboard_data(daily_volume: int = 10000) -> dict:
         except Exception:
             efficiency_data[task_id] = []
 
-    # Compute headline stats
-    completed = [r for r in results if r["metric_value"] is not None]
-    best_oss: Optional[dict] = None
-    best_frontier: Optional[dict] = None
-    best_sft: Optional[dict] = None
-
-    for r in completed:
-        if r["family"] == "open-source" and r["condition"] == "lora-500":
-            if best_oss is None or (r["metric_value"] or 0) > (best_oss["metric_value"] or 0):
-                best_oss = r
-        if r["family"] == "frontier" and r["condition"] == "5-shot":
-            if best_frontier is None or (r["metric_value"] or 0) > (best_frontier["metric_value"] or 0):
-                best_frontier = r
-        if r["family"] == "api-finetuned":
-            if best_sft is None or (r["metric_value"] or 0) > (best_sft["metric_value"] or 0):
-                best_sft = r
-
-    headline_stats = {
-        "best_oss_lora500_vs_frontier": {
-            "oss_model": best_oss["display_name"] if best_oss else None,
-            "oss_metric": best_oss["metric_value"] if best_oss else None,
-            "frontier_model": best_frontier["display_name"] if best_frontier else None,
-            "frontier_metric": best_frontier["metric_value"] if best_frontier else None,
-            "delta": round((best_oss["metric_value"] or 0) - (best_frontier["metric_value"] or 0), 4) if best_oss and best_frontier else None,
-        },
-        "oss_lora500_cost_reduction": {
-            "oss_cost_per_query": best_oss["cost_per_query"] if best_oss else None,
-            "frontier_cost_per_query": best_frontier["cost_per_query"] if best_frontier else None,
-            "reduction_factor": round((best_frontier["cost_per_query"] or 1) / (best_oss["cost_per_query"] or 1), 1) if best_oss and best_frontier and best_oss["cost_per_query"] else None,
-        },
-        "sft_vs_base": {
-            "sft_model": best_sft["display_name"] if best_sft else None,
-            "sft_metric": best_sft["metric_value"] if best_sft else None,
-        },
-    }
-
-    # Training cost is per (model, condition), not per task — deduplicate before summing.
-    seen_training: set[tuple] = set()
-    total_cost = 0.0
-    for r in results:
-        key = (r["model_id"], r["condition"])
-        if key not in seen_training:
-            seen_training.add(key)
-            total_cost += r["training_cost"] or 0
+    headline_stats, tasks_won_by_oss, total_cost = compute_stats(results)
 
     return {
         "generated_at": None,  # filled at write time
         "daily_volume_assumption": daily_volume,
-        "meta": {"total_cost": round(total_cost, 2)},
+        "total_cost": total_cost,
+        "tasks_won_by_oss": tasks_won_by_oss,
         "headline_stats": headline_stats,
         "results": results,
-        "tasks": build_tasks_dict(results),
         "efficiency_data": efficiency_data,
     }
 
@@ -338,17 +351,32 @@ def build_dashboard_data(daily_volume: int = 10000) -> dict:
 @click.option("--daily-volume", default=10000, help="Daily query volume for TCO calc")
 @click.option("--out", default=None, help="Output path (default: data/benchmark/results.json in site)")
 @click.option("--also-benchmark-repo", is_flag=True, help="Also write to dashboard-data/results.json in benchmark repo")
+@click.option("--merge", is_flag=True, help="Preserve existing results where new run has no data (matched by model+task+condition)")
 @click.option("--dry-run", is_flag=True)
-def main(daily_volume: int, out: Optional[str], also_benchmark_repo: bool, dry_run: bool) -> None:
+def main(daily_volume: int, out: Optional[str], also_benchmark_repo: bool, merge: bool, dry_run: bool) -> None:
     """Generate dashboard results.json from summaries."""
     from datetime import datetime, timezone
     data = build_dashboard_data(daily_volume)
-    data["generated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
     # Default output: the site's data/benchmark/results.json
     site_root = REPO_ROOT.parent / "baseweight-site"
     default_out = site_root / "data" / "benchmark" / "results.json"
     out_path = Path(out) if out else default_out
+
+    if merge:
+        fresh = data["results"]
+        merged = merge_results(fresh, out_path)
+        fresh_map = {(r["model_id"], r["task_id"], r["condition"]): r for r in fresh}
+        n_preserved = sum(1 for r in merged if fresh_map.get((r["model_id"], r["task_id"], r["condition"])) is not r)
+        if n_preserved:
+            click.echo(f"  Merge: preserved {n_preserved} existing result(s) with no new data")
+        headline_stats, tasks_won_by_oss, total_cost = compute_stats(merged)
+        data["results"] = merged
+        data["headline_stats"] = headline_stats
+        data["tasks_won_by_oss"] = tasks_won_by_oss
+        data["total_cost"] = total_cost
+
+    data["generated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
     if dry_run:
         n_results = len(data["results"])

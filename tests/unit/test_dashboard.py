@@ -1,11 +1,15 @@
 """Unit tests for generate_dashboard_data.py pure functions."""
+import json
+
 import pytest
 
 from generate_dashboard_data import (
     PricingConfig,
     build_result,
     compute_cost_per_query,
+    compute_stats,
     compute_tco_12mo,
+    merge_results,
 )
 
 pytestmark = pytest.mark.unit
@@ -121,3 +125,119 @@ def test_build_result_display_name(pricing):
 def test_build_result_unknown_model(pricing):
     result = build_result("mystery-model", "fpb", "zero-shot", None, None, pricing)
     assert result["family"] == "frontier"  # default
+
+
+# ── compute_stats ──────────────────────────────────────────────────────────────
+
+def _make_result(model_id, family, condition, metric_value, cost_per_query=None, training_cost=None, task_id="fpb"):
+    return {
+        "model_id": model_id,
+        "display_name": model_id,
+        "family": family,
+        "task_id": task_id,
+        "condition": condition,
+        "metric_value": metric_value,
+        "cost_per_query": cost_per_query,
+        "training_cost": training_cost,
+    }
+
+
+def test_compute_stats_picks_best_oss_lora500():
+    results = [
+        _make_result("qwen3-8b", "open-source", "lora-500", 0.80),
+        _make_result("gemma3-4b", "open-source", "lora-500", 0.75),
+    ]
+    stats, _, _ = compute_stats(results)
+    assert stats["best_oss_lora500_vs_frontier"]["oss_model"] == "qwen3-8b"
+
+
+def test_compute_stats_picks_best_frontier_5shot():
+    results = [
+        _make_result("gpt-4.1", "frontier", "5-shot", 0.82, cost_per_query=0.001),
+        _make_result("gpt-4.1-mini", "frontier", "5-shot", 0.78, cost_per_query=0.0002),
+    ]
+    stats, _, _ = compute_stats(results)
+    assert stats["best_oss_lora500_vs_frontier"]["frontier_model"] == "gpt-4.1"
+
+
+def test_compute_stats_total_cost_deduplicates_by_model_condition():
+    results = [
+        _make_result("qwen3-8b", "open-source", "lora-500", 0.8, training_cost=2.5, task_id="fpb"),
+        _make_result("qwen3-8b", "open-source", "lora-500", 0.7, training_cost=2.5, task_id="banking77"),
+    ]
+    _, _, total_cost = compute_stats(results)
+    assert total_cost == pytest.approx(2.5)  # not 5.0 — same model+condition across tasks
+
+
+def test_compute_stats_empty_results():
+    stats, tasks_won, total_cost = compute_stats([])
+    assert stats["best_oss_lora500_vs_frontier"]["oss_model"] is None
+    assert stats["best_oss_lora500_vs_frontier"]["frontier_model"] is None
+    assert total_cost == 0.0
+    assert tasks_won == 0
+
+
+def test_compute_stats_ignores_null_metric_values():
+    results = [
+        _make_result("qwen3-8b", "open-source", "lora-500", None),
+        _make_result("gpt-4.1", "frontier", "5-shot", None),
+    ]
+    stats, _, _ = compute_stats(results)
+    assert stats["best_oss_lora500_vs_frontier"]["oss_model"] is None
+
+
+# ── merge_results ──────────────────────────────────────────────────────────────
+
+def _write_existing(path, results):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"results": results}))
+
+
+def test_merge_results_no_existing_file_returns_fresh(tmp_path):
+    fresh = [_make_result("gpt-4.1", "frontier", "zero-shot", 0.82)]
+    merged = merge_results(fresh, tmp_path / "nonexistent.json")
+    assert merged == fresh
+
+
+def test_merge_results_fresh_wins_when_nonnull(tmp_path):
+    out = tmp_path / "results.json"
+    prior = [_make_result("gpt-4.1", "frontier", "zero-shot", 0.75)]
+    _write_existing(out, prior)
+
+    fresh = [_make_result("gpt-4.1", "frontier", "zero-shot", 0.82)]
+    merged = merge_results(fresh, out)
+    assert merged[0]["metric_value"] == pytest.approx(0.82)
+
+
+def test_merge_results_preserves_existing_when_fresh_null(tmp_path):
+    out = tmp_path / "results.json"
+    prior = [_make_result("gpt-4.1", "frontier", "zero-shot", 0.75)]
+    _write_existing(out, prior)
+
+    fresh = [_make_result("gpt-4.1", "frontier", "zero-shot", None)]
+    merged = merge_results(fresh, out)
+    assert merged[0]["metric_value"] == pytest.approx(0.75)
+
+
+def test_merge_results_new_key_not_in_existing_kept(tmp_path):
+    out = tmp_path / "results.json"
+    prior = [_make_result("gpt-4.1", "frontier", "zero-shot", 0.75)]
+    _write_existing(out, prior)
+
+    # New model not in prior — should be included unchanged
+    fresh = [
+        _make_result("gpt-4.1", "frontier", "zero-shot", None),
+        _make_result("claude-sonnet-4", "frontier", "zero-shot", 0.79),
+    ]
+    merged = merge_results(fresh, out)
+    claude = next(r for r in merged if r["model_id"] == "claude-sonnet-4")
+    assert claude["metric_value"] == pytest.approx(0.79)
+
+
+def test_merge_results_handles_corrupt_existing(tmp_path):
+    out = tmp_path / "results.json"
+    out.write_text("not valid json {{{")
+
+    fresh = [_make_result("gpt-4.1", "frontier", "zero-shot", 0.82)]
+    merged = merge_results(fresh, out)
+    assert merged == fresh
