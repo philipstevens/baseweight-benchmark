@@ -1,13 +1,12 @@
 """Download raw datasets from HuggingFace for all benchmark tasks."""
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 from typing import Optional
 
 import click
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 import yaml
 
 # Expected minimum row counts for sanity checks (split: min_count)
@@ -43,11 +42,54 @@ def load_task_configs(task_ids: list[str]) -> list[TaskConfig]:
 
 ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa", "mbpp"]
 
+TINY_TRAIN = 12
+TINY_TEST = 5
+
+
+def download_task(cfg: TaskConfig, dry_run: bool, tiny: bool = False) -> None:
+    click.echo(f"\n[{cfg.task_id}] Downloading {cfg.task_name}...")
+    if dry_run:
+        click.echo(f"  [dry-run] Would download {cfg.dataset_path} (config={cfg.dataset_config})")
+        return
+
+    from datasets import load_dataset, DatasetDict  # lazy import
+    out_dir = REPO_ROOT / "data" / "raw" / cfg.task_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    load_kwargs: dict = {"trust_remote_code": True}
+    if cfg.dataset_config:
+        load_kwargs["name"] = cfg.dataset_config
+
+    if tiny:
+        loaded = {}
+        for split in ("train", "test", "validation"):
+            limit = TINY_TRAIN if split == "train" else TINY_TEST
+            try:
+                ds_split = load_dataset(cfg.dataset_path, split=f"{split}[:{limit}]", **load_kwargs)
+                loaded[split] = ds_split
+                click.echo(f"  {split}: {len(ds_split)} rows (tiny)")
+            except Exception:
+                pass
+        if not loaded:
+            raise RuntimeError(f"No valid splits found for {cfg.dataset_path}")
+        ds = DatasetDict(loaded)
+    else:
+        ds = load_dataset(cfg.dataset_path, **load_kwargs)
+        for split, dataset in ds.items():
+            count = len(dataset)
+            expected = EXPECTED_COUNTS.get(cfg.task_id, {}).get(split, 0)
+            status = "OK" if count >= expected else f"WARNING: expected >= {expected}"
+            click.echo(f"  {split}: {count:,} rows — {status}")
+
+    ds.save_to_disk(str(out_dir))
+    click.echo(f"  Saved to {out_dir}")
+
 
 @click.command()
 @click.option("--task", default=None, help="Task ID to download (required; use 'all' to download every task)")
 @click.option("--dry-run", is_flag=True, help="Validate config without downloading")
-def main(task: str, dry_run: bool) -> None:
+@click.option("--tiny", is_flag=True, help=f"Download only {TINY_TRAIN} train + {TINY_TEST} test rows for local CPU testing")
+def main(task: str, dry_run: bool, tiny: bool) -> None:
     """Download benchmark datasets from HuggingFace.
 
     You must specify --task <id> or --task all. No default — downloading all
@@ -60,32 +102,8 @@ def main(task: str, dry_run: bool) -> None:
 
     failures = []
     for cfg in configs:
-        click.echo(f"\n[{cfg.task_id}] Downloading {cfg.task_name}...")
-        if dry_run:
-            click.echo(f"  [dry-run] Would download {cfg.dataset_path} (config={cfg.dataset_config})")
-            continue
         try:
-            from datasets import load_dataset  # lazy import — not needed for dry-run
-            out_dir = REPO_ROOT / "data" / "raw" / cfg.task_id
-            out_dir.mkdir(parents=True, exist_ok=True)
-
-            kwargs = {"path": cfg.dataset_path, "trust_remote_code": True}
-            if cfg.dataset_config:
-                kwargs["name"] = cfg.dataset_config
-
-            ds = load_dataset(**kwargs)
-
-            # Print row counts
-            for split, dataset in ds.items():
-                count = len(dataset)
-                expected = EXPECTED_COUNTS.get(cfg.task_id, {}).get(split, 0)
-                status = "OK" if count >= expected else f"WARNING: expected >= {expected}"
-                click.echo(f"  {split}: {count:,} rows — {status}")
-
-            # Save to disk
-            ds.save_to_disk(str(out_dir))
-            click.echo(f"  Saved to {out_dir}")
-
+            download_task(cfg, dry_run, tiny=tiny)
         except Exception as exc:
             click.echo(f"  ERROR: {exc}", err=True)
             failures.append((cfg.task_id, str(exc)))

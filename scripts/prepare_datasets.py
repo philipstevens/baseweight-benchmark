@@ -154,9 +154,10 @@ def write_jsonl(rows: list[dict], path: Path) -> None:
 
 # ── Per-task preprocessing ─────────────────────────────────────────────────
 
-def process_task(cfg: TaskConfig, dry_run: bool) -> None:
+def process_task(cfg: TaskConfig, dry_run: bool, tiny: bool = False) -> None:
     from datasets import load_from_disk, Dataset  # lazy
-    click.echo(f"\n[{cfg.task_id}] Processing {cfg.task_name}...")
+    label = " (tiny)" if tiny else ""
+    click.echo(f"\n[{cfg.task_id}] Processing {cfg.task_name}{label}...")
 
     raw_dir = REPO_ROOT / "data" / "raw" / cfg.task_id
     out_dir = REPO_ROOT / "data" / "prepared" / cfg.task_id
@@ -218,8 +219,12 @@ def process_task(cfg: TaskConfig, dry_run: bool) -> None:
                 ctx = truncate_context(row.get("context", ""), cfg.context_max_tokens or 1500)
                 answers = row.get("answers", {})
                 texts = answers.get("text", []) if isinstance(answers, dict) else []
-                ans_text = texts[0] if texts else "Not found."
-                out.append({"context": ctx, "question": row.get("question", ""), "answer_text": ans_text, "_id": row.get("id", "")})
+                out.append({
+                    "context": ctx,
+                    "question": row.get("question", ""),
+                    "answers": {"text": [texts[0]] if texts else [], "answer_start": [0] if texts else []},
+                    "id": row.get("id", ""),
+                })
             return out
         train_rows = flatten_squad(train_rows)
         test_rows = flatten_squad(test_rows)
@@ -291,7 +296,8 @@ def process_task(cfg: TaskConfig, dry_run: bool) -> None:
 @click.command()
 @click.option("--task", default=None, help="Task ID to prepare (required; use 'all' to prepare every task)")
 @click.option("--dry-run", is_flag=True, help="Validate without processing")
-def main(task: str, dry_run: bool) -> None:
+@click.option("--tiny", is_flag=True, help="Signal that raw data was downloaded in tiny mode (no effect on processing)")
+def main(task: str, dry_run: bool, tiny: bool) -> None:
     """Prepare datasets: split, sample, and format into chat JSONL.
 
     You must specify --task <id> or --task all. No default — raw data must
@@ -304,7 +310,7 @@ def main(task: str, dry_run: bool) -> None:
     for tid in task_ids:
         try:
             cfg = load_task_config(tid)
-            process_task(cfg, dry_run)
+            process_task(cfg, dry_run, tiny=tiny)
         except Exception as exc:
             click.echo(f"  ERROR [{tid}]: {exc}", err=True)
             import traceback; traceback.print_exc()
