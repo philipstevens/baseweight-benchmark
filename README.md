@@ -122,7 +122,7 @@ Model training configs live in `configs/training/<model_id>.yaml` and control Lo
 
 API pricing is in `configs/pricing.yaml` and feeds cost-per-query and TCO calculations in the dashboard.
 
-## Artifact persistence (RunPod / remote GPU)
+## Artifact persistence (remote GPU)
 
 ```bash
 # Sync everything to HuggingFace (safe to run any time)

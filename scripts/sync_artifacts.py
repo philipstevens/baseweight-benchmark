@@ -1,6 +1,6 @@
-"""Sync all run artifacts to HuggingFace for RunPod persistence.
+"""Sync all run artifacts to HuggingFace for persistence on remote GPU instances.
 
-Run this after any training or eval step to ensure nothing is lost if the pod
+Run this after any training or eval step to ensure nothing is lost if the instance
 terminates. Safe to run multiple times — existing files are skipped.
 
 Usage:
@@ -181,7 +181,7 @@ def sync_training_metadata(api, dry_run: bool) -> int:
 )
 @click.option("--dry-run", is_flag=True)
 def main(what: str, dry_run: bool) -> None:
-    """Sync all run artifacts to HuggingFace (RunPod persistence)."""
+    """Sync all run artifacts to HuggingFace for remote instance persistence."""
     if dry_run:
         click.echo("  [dry-run mode — no uploads will occur]\n")
         api = None

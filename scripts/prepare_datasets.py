@@ -118,6 +118,8 @@ def stratified_sample(rows: list[dict], label_key: str, n: int, seed: int = 42) 
 
 def nested_samples(rows: list[dict], sizes: list[int], label_key: Optional[str], seed: int = 42) -> dict[int, list[dict]]:
     """Return nested samples: 50 ⊂ 200 ⊂ 500 ⊂ ... Each is a superset of the previous."""
+    if not sizes:
+        return {}
     result = {}
     rng = random.Random(seed)
     # Start with largest sample

@@ -2,11 +2,16 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Optional
+
+from dotenv import load_dotenv
+load_dotenv()
 
 import click
 import yaml
@@ -23,7 +28,7 @@ from checkpoint_utils import (
 REPO_ROOT = Path(__file__).parent.parent
 ALL_TASKS = ["banking77", "cuad"]
 ALL_MODELS = ["qwen3-8b"]
-GPU_HOURLY = 0.49  # RTX 4090 on RunPod ($0.44–0.54/hr midpoint)
+GPU_HOURLY = 0.49  # Default GPU hourly rate — override via pricing.yaml
 
 
 class ModelConfig(BaseModel):
@@ -132,66 +137,138 @@ def train_one(
     model_id = model_cfg.model_id
     substituted = False
 
+    # --tiny = Intel XPU backend (Unsloth installed with Intel GPU support)
+    # no flag = CUDA backend (Unsloth installed with CUDA support)
     if tiny:
-        # CPU path: standard transformers + PEFT, no Unsloth or GPU required.
+        os.environ.setdefault("UNSLOTH_DISABLE_AUTO_PADDING_FREE", "1")
+        # Disable torch.dynamo/compile for XPU: our Python Tensor.to patch is not
+        # traceable by dynamo (it wraps a C++ builtin), and Triton compilation fails
+        # anyway (missing level_zero/ze_api.h). Eager mode is correct here.
+        os.environ["TORCHDYNAMO_DISABLE"] = "1"
+
+        # unsloth_zoo queries mem_get_info at import time; Intel iGPUs don't support it.
+        # Patch before import so the call returns a plausible (free, total) tuple instead.
         import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        from peft import LoraConfig, get_peft_model, TaskType
+        _orig_mem_get_info = torch.xpu.mem_get_info
+        def _safe_mem_get_info(device=None):
+            try:
+                return _orig_mem_get_info(device)
+            except RuntimeError:
+                total = torch.xpu.get_device_properties(0).total_memory
+                return (total, total)
+        torch.xpu.mem_get_info = _safe_mem_get_info
+        torch.xpu.memory.mem_get_info = _safe_mem_get_info
 
-        click.echo(f"  [tiny] Loading {model_id} on CPU (float32, no quantization)...")
-        model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float32)
-        tokenizer = AutoTokenizer.from_pretrained(model_id)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
+        # Intel Iris Xe iGPU (0x9a49) raises UR_RESULT_ERROR_INVALID_ARGUMENT (45) for
+        # dtype conversions on XPU — float32 casts, bool casts, .float() calls, etc.
+        #   - bool target: use comparison (tensor != 0) which XPU supports
+        #   - other failures: round-trip via CPU (device transfers work; dtype casts don't)
+        #   - float32/float16 redirected to bfloat16 (device's native float dtype)
+        _orig_tensor_to = torch.Tensor.to
 
-        peft_config = LoraConfig(
-            r=lora_cfg.get("rank", 4),
-            lora_alpha=lora_cfg.get("alpha", 8),
-            lora_dropout=lora_cfg.get("dropout", 0.0),
-            bias="none",
-            task_type=TaskType.CAUSAL_LM,
+        def _xpu_safe_dtype_cast(self, target_dtype):
+            if target_dtype == torch.bool:
+                return (self != 0)
+            effective = (
+                torch.bfloat16 if target_dtype in (torch.float32, torch.float16)
+                else target_dtype
+            )
+            try:
+                cpu_t = _orig_tensor_to(self, torch.device("cpu"))
+                if cpu_t.dtype != effective:
+                    cpu_t = _orig_tensor_to(cpu_t, effective)
+                return _orig_tensor_to(cpu_t, self.device)
+            except Exception:
+                return self
+
+        def _xpu_persistent_tensor_to(self, *args, **kw):
+            if self.device.type != "xpu":
+                return _orig_tensor_to(self, *args, **kw)
+            try:
+                return _orig_tensor_to(self, *args, **kw)
+            except RuntimeError as _e:
+                if "UR error" not in str(_e):
+                    raise
+                _dtype = kw.get("dtype") or next(
+                    (a for a in args if isinstance(a, torch.dtype)), None
+                )
+                if _dtype is not None:
+                    return _xpu_safe_dtype_cast(self, _dtype)
+                return self
+        torch.Tensor.to = _xpu_persistent_tensor_to
+
+        # .float() bypasses Tensor.to on the Python side
+        _orig_tensor_float = torch.Tensor.float
+        def _xpu_persistent_float(self):
+            if self.device.type == "xpu":
+                return _xpu_safe_dtype_cast(self, torch.float32)
+            return _orig_tensor_float(self)
+        torch.Tensor.float = _xpu_persistent_float
+
+    try:
+        from unsloth import FastModel
+    except ImportError:
+        backend_label = "Intel GPU" if tiny else "CUDA"
+        raise RuntimeError(f"Unsloth not installed with {backend_label} support. See: https://unsloth.ai/docs/get-started/install")
+
+    backend = "XPU" if tiny else "CUDA"
+    click.echo(f"  Loading {model_id} on {backend}...")
+
+    import torch as _torch
+    # XPU supports bfloat16; load in bf16 so base model and LoRA adapters share the same dtype.
+    # For CUDA the config dtype drives the choice (None = auto).
+    _dtype = _torch.bfloat16 if tiny else None
+
+    if tiny:
+        # PEFT's cast_adapter_dtype calls param.data.to(torch.float32) on device tensors.
+        # Disable autocast so it skips the cast entirely; our Tensor.to patch handles any
+        # remaining calls, but avoiding them up-front is cleaner.
+        import peft.tuners.tuners_utils as _peft_utils
+        _orig_cast = _peft_utils.cast_adapter_dtype
+        def _xpu_cast_adapter_dtype(model, adapter_name, autocast_adapter_dtype=True):
+            _orig_cast(model, adapter_name, autocast_adapter_dtype=False)
+        _peft_utils.cast_adapter_dtype = _xpu_cast_adapter_dtype
+
+    try:
+        model, tokenizer = FastModel.from_pretrained(
+            model_name=model_id,
+            max_seq_length=seq_len,
+            load_in_4bit=model_cfg.load_in_4bit,
+            dtype=_dtype,
         )
-        model = get_peft_model(model, peft_config)
-        model.print_trainable_parameters()
-    else:
-        # GPU path: Unsloth + 4-bit quantization.
-        try:
-            from unsloth import FastModel
-        except ImportError:
-            raise RuntimeError("Unsloth not installed. Run: pip install 'unsloth[cu124-torch260]'")
-
-        try:
+    except Exception as exc:
+        if model_cfg.fallback_model_id:
+            click.echo(f"  WARNING: {model_id} failed ({exc}). Falling back to {model_cfg.fallback_model_id}")
+            model_id = model_cfg.fallback_model_id
+            substituted = True
             model, tokenizer = FastModel.from_pretrained(
                 model_name=model_id,
                 max_seq_length=seq_len,
                 load_in_4bit=model_cfg.load_in_4bit,
-                dtype=None,
+                dtype=_dtype,
             )
-        except Exception as exc:
-            if model_cfg.fallback_model_id:
-                click.echo(f"  WARNING: {model_id} failed ({exc}). Falling back to {model_cfg.fallback_model_id}")
-                model_id = model_cfg.fallback_model_id
-                substituted = True
-                model, tokenizer = FastModel.from_pretrained(
-                    model_name=model_id,
-                    max_seq_length=seq_len,
-                    load_in_4bit=model_cfg.load_in_4bit,
-                    dtype=None,
-                )
-            else:
-                raise
+        else:
+            raise
 
-        model = FastModel.get_peft_model(
-            model,
-            finetune_language_layers=True,
-            finetune_attention_modules=True,
-            finetune_mlp_modules=True,
-            r=lora_cfg.get("rank", 32),
-            lora_alpha=lora_cfg.get("alpha", 64),
-            lora_dropout=lora_cfg.get("dropout", 0.05),
-            bias="none",
-            use_rslora=lora_cfg.get("use_rslora", True),
-        )
+    model = FastModel.get_peft_model(
+        model,
+        finetune_language_layers=True,
+        finetune_attention_modules=True,
+        finetune_mlp_modules=True,
+        r=lora_cfg.get("rank", 32),
+        lora_alpha=lora_cfg.get("alpha", 64),
+        lora_dropout=lora_cfg.get("dropout", 0.05),
+        bias="none",
+        use_rslora=lora_cfg.get("use_rslora", True),
+        use_gradient_checkpointing=False if tiny else "unsloth",
+    )
+
+    if tiny:
+        # XPU compute ops (pow, mean, etc.) fail on Intel Iris Xe Tiger Lake with
+        # UR_RESULT_ERROR_INVALID_ARGUMENT. Device transfers work, compute doesn't.
+        # Fall back to CPU for the actual training loop.
+        click.echo("  Moving model to CPU (XPU compute not supported on this device)...")
+        model = model.to("cpu")
 
     from trl import SFTTrainer, SFTConfig
     from transformers import TrainerCallback
@@ -212,20 +289,21 @@ def train_one(
         rows = [json.loads(line) for line in f]
     train_ds = hf_datasets.Dataset.from_list(rows)
 
-    # For Qwen3 with enable_thinking=False, pre-apply the chat template so
-    # the <think> tokens are never generated during training.
+    # Pre-apply the chat template so trl tokenizes a plain "text" field.
+    # When enable_thinking is explicitly False, suppress <think> tokens.
+    template_kwargs = {}
     if model_cfg.enable_thinking is False:
-        def apply_template(example):
-            return {"text": tokenizer.apply_chat_template(
-                example["messages"],
-                tokenize=False,
-                add_generation_prompt=False,
-                enable_thinking=False,
-            )}
-        train_ds = train_ds.map(apply_template)
-        dataset_text_field = "text"
-    else:
-        dataset_text_field = "messages"
+        template_kwargs["enable_thinking"] = False
+
+    def apply_template(example):
+        return {"text": tokenizer.apply_chat_template(
+            example["messages"],
+            tokenize=False,
+            add_generation_prompt=False,
+            **template_kwargs,
+        )}
+    train_ds = train_ds.map(apply_template)
+    dataset_text_field = "text"
 
     training_cfg = model_cfg.training
     if tiny:
@@ -234,15 +312,17 @@ def train_one(
             num_train_epochs=1,
             per_device_train_batch_size=1,
             gradient_accumulation_steps=1,
-            learning_rate=training_cfg.get("learning_rate", 2e-4),
+            learning_rate=float(training_cfg.get("learning_rate", 2e-4)),
             lr_scheduler_type="constant",
             warmup_ratio=0.0,
             weight_decay=training_cfg.get("weight_decay", 0.01),
-            optim=training_cfg.get("optim", "adamw_torch"),
+            optim="adamw_torch",
             max_grad_norm=1.0,
+            use_cpu=True,
             bf16=False,
             fp16=False,
             seed=training_cfg.get("seed", 42),
+            gradient_checkpointing=False,
             save_strategy="no",
             eval_strategy="no",
             load_best_model_at_end=False,
@@ -258,7 +338,7 @@ def train_one(
             num_train_epochs=epochs,
             per_device_train_batch_size=training_cfg.get("per_device_train_batch_size", 4),
             gradient_accumulation_steps=training_cfg.get("gradient_accumulation_steps", 4),
-            learning_rate=training_cfg.get("learning_rate", 2e-4),
+            learning_rate=float(training_cfg.get("learning_rate", 2e-4)),
             lr_scheduler_type=training_cfg.get("lr_scheduler_type", "cosine"),
             warmup_ratio=training_cfg.get("warmup_ratio", 0.05),
             weight_decay=training_cfg.get("weight_decay", 0.01),
@@ -348,11 +428,9 @@ def _upload_adapter(model_short: str, task_id: str, condition: str) -> None:
 @click.option("--condition", default="all", help="lora-500|lora-full|all")
 @click.option("--auto-upload", is_flag=True, help="Upload adapter to HuggingFace after each run (persistence)")
 @click.option("--dry-run", is_flag=True, help="Validate configs without training")
-@click.option("--tiny", is_flag=True, help="CPU test mode: Qwen2.5-0.5B via transformers+PEFT, no Unsloth or GPU")
+@click.option("--tiny", is_flag=True, help="Use XPU backend (Unsloth with Intel GPU support). Default uses CUDA.")
 def main(model: str, task: str, condition: str, auto_upload: bool, dry_run: bool, tiny: bool) -> None:
-    """QLoRA fine-tune Qwen3-8B on BANKING77 and CUAD."""
-    if tiny and model in ALL_MODELS + ["all"]:
-        model = "tiny"  # use CPU-safe config automatically
+    """QLoRA fine-tune on BANKING77 and CUAD via Unsloth (CUDA or Intel XPU)."""
     model_ids = ALL_MODELS if model == "all" else [model]
     task_ids = ALL_TASKS if task == "all" else [task]
     conditions = ["lora-500", "lora-full"] if condition == "all" else [condition]
@@ -374,6 +452,7 @@ def main(model: str, task: str, condition: str, auto_upload: bool, dry_run: bool
                     train_one(model_cfg, task_cfg, cond, data_file, dry_run, auto_upload=auto_upload, tiny=tiny)
                 except Exception as exc:
                     click.echo(f"  ERROR [{mid}/{tid}/{cond}]: {exc}", err=True)
+                    traceback.print_exc()
                     failures.append((f"{mid}/{tid}/{cond}", str(exc)))
 
     if failures:

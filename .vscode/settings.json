@@ -1,0 +1,4 @@
+{
+  "python.defaultInterpreterPath": "/home/pstevens/miniconda3/envs/baseweight-benchmark/bin/python",
+  "python.terminal.activateEnvironment": false
+}

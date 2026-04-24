@@ -47,7 +47,7 @@ MODEL_CONDITIONS = {
 }
 
 # GPU cost for self-hosted models (loaded from pricing.yaml)
-GPU_HOURLY = 0.49  # RTX 4090 on RunPod
+GPU_HOURLY = 0.49  # Default GPU hourly rate — override via pricing.yaml
 QUERIES_PER_HOUR = 2000
 
 

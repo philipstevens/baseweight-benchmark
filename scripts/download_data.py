@@ -12,7 +12,7 @@ import yaml
 # Expected minimum row counts for sanity checks (split: min_count)
 EXPECTED_COUNTS: dict[str, dict[str, int]] = {
     "banking77": {"train": 8000,  "test": 2000},
-    "cuad":      {"train": 100},
+    "cuad":      {"train": 10000, "test": 4000},
     "ledgar":    {"train": 50000, "test": 5000},
     "fpb":       {"train": 3000},
     "medmcqa":   {"train": 100000, "test": 4000},
@@ -56,21 +56,24 @@ def download_task(cfg: TaskConfig, dry_run: bool, tiny: bool = False) -> None:
     out_dir = REPO_ROOT / "data" / "raw" / cfg.task_id
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    load_kwargs: dict = {"trust_remote_code": True}
+    load_kwargs: dict = {}
     if cfg.dataset_config:
         load_kwargs["name"] = cfg.dataset_config
 
     if tiny:
         loaded = {}
+        split_errors: list[str] = []
         for split in ("train", "test", "validation"):
             limit = TINY_TRAIN if split == "train" else TINY_TEST
             try:
                 ds_split = load_dataset(cfg.dataset_path, split=f"{split}[:{limit}]", **load_kwargs)
                 loaded[split] = ds_split
                 click.echo(f"  {split}: {len(ds_split)} rows (tiny)")
-            except Exception:
-                pass
+            except Exception as e:
+                split_errors.append(f"{split}: {e}")
         if not loaded:
+            for err in split_errors:
+                click.echo(f"  {err}", err=True)
             raise RuntimeError(f"No valid splits found for {cfg.dataset_path}")
         ds = DatasetDict(loaded)
     else:

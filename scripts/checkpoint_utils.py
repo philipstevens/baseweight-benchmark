@@ -1,4 +1,4 @@
-"""Fault-tolerant checkpoint and recovery utilities for RunPod training.
+"""Fault-tolerant checkpoint and recovery utilities for remote GPU training.
 
 Network volume layout (under NETWORK_VOLUME/checkpoints/<model>/<task>/<condition>/):
   checkpoint-N/      HF Trainer intermediate checkpoints (one per epoch)
@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-# Set NETWORK_VOLUME to the RunPod network volume mount point.
+# Set NETWORK_VOLUME to your remote GPU network volume mount point.
 NETWORK_VOLUME = Path(os.environ.get("NETWORK_VOLUME", "/workspace"))
 
 

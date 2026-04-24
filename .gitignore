@@ -15,3 +15,5 @@ venv/
 docs/
 PLAYBOOK.md
 TESTING.md
+workspace/
+unsloth_compiled_cache/
