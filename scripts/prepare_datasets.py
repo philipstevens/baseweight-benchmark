@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import os
 import random
+import shutil
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -11,6 +13,8 @@ from typing import Any, Optional
 import click
 import yaml
 from pydantic import BaseModel, Field
+
+from checkpoint_utils import nv_prepared_dir
 
 REPO_ROOT = Path(__file__).parent.parent
 SEED = 42
@@ -293,6 +297,11 @@ def process_task(cfg: TaskConfig, dry_run: bool, tiny: bool = False) -> None:
     write_jsonl(fmt_rows(train_500), out_dir / "openai_sft_500.jsonl")
 
     click.echo(f"  [{cfg.task_id}] Done — {len(test_rows)} test, {len(train_500)} train_500, {len(train_full)} train_full")
+
+    if os.environ.get("NETWORK_VOLUME"):
+        nv_dir = nv_prepared_dir(cfg.task_id)
+        shutil.copytree(str(out_dir), str(nv_dir), dirs_exist_ok=True)
+        click.echo(f"  Mirrored to {nv_dir}")
 
 
 @click.command()

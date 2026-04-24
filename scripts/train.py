@@ -1,4 +1,4 @@
-"""QLoRA fine-tuning for Qwen3-8B on BANKING77 and CUAD."""
+"""QLoRA fine-tuning for open-source models via Unsloth."""
 from __future__ import annotations
 
 import json
@@ -18,15 +18,18 @@ import yaml
 from pydantic import BaseModel, Field
 
 from checkpoint_utils import (
+    NETWORK_VOLUME,
     atomic_write_json,
     checkpoint_dir,
     find_hf_resume_checkpoint,
     load_train_state,
+    nv_prepared_dir,
     save_train_state,
+    training_log,
 )
 
 REPO_ROOT = Path(__file__).parent.parent
-ALL_TASKS = ["banking77", "cuad"]
+ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa", "mbpp"]
 ALL_MODELS = ["qwen3-8b"]
 GPU_HOURLY = 0.49  # Default GPU hourly rate — override via pricing.yaml
 
@@ -86,7 +89,7 @@ def train_one(
     data_path: Path,
     dry_run: bool,
     auto_upload: bool = False,
-    tiny: bool = False,
+    local: bool = False,
 ) -> dict:
     """Train a single model/task/condition. Returns metadata dict."""
     task_id = task_cfg.task_id
@@ -100,7 +103,7 @@ def train_one(
     log_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    epochs = get_epochs(n_train)
+    epochs = 1 if local else get_epochs(n_train)
     click.echo(f"  [{model_cfg.model_short}/{task_id}/{condition}] n={n_train}, epochs={epochs}, seq_len={seq_len}")
 
     prior_state = load_train_state(model_cfg.model_short, task_id, condition)
@@ -133,208 +136,187 @@ def train_one(
         "global_step": 0,
     })
 
-    lora_cfg = model_cfg.lora
-    model_id = model_cfg.model_id
-    substituted = False
+    with training_log(ckpt_dir):
+        lora_cfg = model_cfg.lora
+        model_id = model_cfg.model_id
+        substituted = False
 
-    # --tiny = Intel XPU backend (Unsloth installed with Intel GPU support)
-    # no flag = CUDA backend (Unsloth installed with CUDA support)
-    if tiny:
-        os.environ.setdefault("UNSLOTH_DISABLE_AUTO_PADDING_FREE", "1")
-        # Disable torch.dynamo/compile for XPU: our Python Tensor.to patch is not
-        # traceable by dynamo (it wraps a C++ builtin), and Triton compilation fails
-        # anyway (missing level_zero/ze_api.h). Eager mode is correct here.
-        os.environ["TORCHDYNAMO_DISABLE"] = "1"
+        _load_dtype = None                    # auto
+        _use_grad_ckpt: bool | str = "unsloth"
+        _sft_overrides: dict = {}
+        _local_device = "cpu"                 # resolved below when local=True
 
-        # unsloth_zoo queries mem_get_info at import time; Intel iGPUs don't support it.
-        # Patch before import so the call returns a plausible (free, total) tuple instead.
-        import torch
-        _orig_mem_get_info = torch.xpu.mem_get_info
-        def _safe_mem_get_info(device=None):
-            try:
-                return _orig_mem_get_info(device)
-            except RuntimeError:
-                total = torch.xpu.get_device_properties(0).total_memory
-                return (total, total)
-        torch.xpu.mem_get_info = _safe_mem_get_info
-        torch.xpu.memory.mem_get_info = _safe_mem_get_info
+        if local:
+            import torch
 
-        # Intel Iris Xe iGPU (0x9a49) raises UR_RESULT_ERROR_INVALID_ARGUMENT (45) for
-        # dtype conversions on XPU — float32 casts, bool casts, .float() calls, etc.
-        #   - bool target: use comparison (tensor != 0) which XPU supports
-        #   - other failures: round-trip via CPU (device transfers work; dtype casts don't)
-        #   - float32/float16 redirected to bfloat16 (device's native float dtype)
-        _orig_tensor_to = torch.Tensor.to
+            if torch.cuda.is_available():
+                _local_device = "cuda"
+            elif hasattr(torch, "xpu") and torch.xpu.is_available():
+                _local_device = "xpu"
+            else:
+                _local_device = "cpu"
 
-        def _xpu_safe_dtype_cast(self, target_dtype):
-            if target_dtype == torch.bool:
-                return (self != 0)
-            effective = (
-                torch.bfloat16 if target_dtype in (torch.float32, torch.float16)
-                else target_dtype
-            )
-            try:
-                cpu_t = _orig_tensor_to(self, torch.device("cpu"))
-                if cpu_t.dtype != effective:
-                    cpu_t = _orig_tensor_to(cpu_t, effective)
-                return _orig_tensor_to(cpu_t, self.device)
-            except Exception:
-                return self
+            click.echo(f"  [local] Device: {_local_device.upper()}")
 
-        def _xpu_persistent_tensor_to(self, *args, **kw):
-            if self.device.type != "xpu":
-                return _orig_tensor_to(self, *args, **kw)
-            try:
-                return _orig_tensor_to(self, *args, **kw)
-            except RuntimeError as _e:
-                if "UR error" not in str(_e):
-                    raise
-                _dtype = kw.get("dtype") or next(
-                    (a for a in args if isinstance(a, torch.dtype)), None
-                )
-                if _dtype is not None:
-                    return _xpu_safe_dtype_cast(self, _dtype)
-                return self
-        torch.Tensor.to = _xpu_persistent_tensor_to
+            if _local_device == "xpu":
+                os.environ.setdefault("UNSLOTH_DISABLE_AUTO_PADDING_FREE", "1")
+                # Disable torch.dynamo: our Tensor.to patch isn't dynamo-traceable,
+                # and Triton XPU kernel compilation may fail without the full XPU SDK.
+                os.environ["TORCHDYNAMO_DISABLE"] = "1"
 
-        # .float() bypasses Tensor.to on the Python side
-        _orig_tensor_float = torch.Tensor.float
-        def _xpu_persistent_float(self):
-            if self.device.type == "xpu":
-                return _xpu_safe_dtype_cast(self, torch.float32)
-            return _orig_tensor_float(self)
-        torch.Tensor.float = _xpu_persistent_float
+                # unsloth_zoo calls mem_get_info at import time; may not be supported on
+                # all XPU devices. Patch to return a safe fallback instead of crashing.
+                _orig_mem_get_info = torch.xpu.mem_get_info
+                def _safe_mem_get_info(device=None):
+                    try:
+                        return _orig_mem_get_info(device)
+                    except RuntimeError:
+                        total = torch.xpu.get_device_properties(0).total_memory
+                        return (total, total)
+                torch.xpu.mem_get_info = _safe_mem_get_info
+                torch.xpu.memory.mem_get_info = _safe_mem_get_info
 
-    try:
-        from unsloth import FastModel
-    except ImportError:
-        backend_label = "Intel GPU" if tiny else "CUDA"
-        raise RuntimeError(f"Unsloth not installed with {backend_label} support. See: https://unsloth.ai/docs/get-started/install")
+                # Some XPU devices raise UR_RESULT_ERROR_INVALID_ARGUMENT (45) on
+                # in-device dtype casts. Patch Tensor.to/.float() with workarounds:
+                #   - bool: use (tensor != 0) comparison instead of a cast
+                #   - float32/float16 → bfloat16 (device's native float dtype)
+                #   - other casts: round-trip via CPU (transfers work; in-device casts may not)
+                _orig_tensor_to = torch.Tensor.to
 
-    backend = "XPU" if tiny else "CUDA"
-    click.echo(f"  Loading {model_id} on {backend}...")
+                def _xpu_safe_dtype_cast(self, target_dtype):
+                    if target_dtype == torch.bool:
+                        return (self != 0)
+                    effective = torch.bfloat16 if target_dtype in (torch.float32, torch.float16) else target_dtype
+                    try:
+                        cpu_t = _orig_tensor_to(self, torch.device("cpu"))
+                        if cpu_t.dtype != effective:
+                            cpu_t = _orig_tensor_to(cpu_t, effective)
+                        return _orig_tensor_to(cpu_t, self.device)
+                    except Exception:
+                        return self
 
-    import torch as _torch
-    # XPU supports bfloat16; load in bf16 so base model and LoRA adapters share the same dtype.
-    # For CUDA the config dtype drives the choice (None = auto).
-    _dtype = _torch.bfloat16 if tiny else None
+                def _xpu_persistent_tensor_to(self, *args, **kw):
+                    if self.device.type != "xpu":
+                        return _orig_tensor_to(self, *args, **kw)
+                    try:
+                        return _orig_tensor_to(self, *args, **kw)
+                    except RuntimeError as _e:
+                        if "UR error" not in str(_e):
+                            raise
+                        _dtype = kw.get("dtype") or next((a for a in args if isinstance(a, torch.dtype)), None)
+                        return _xpu_safe_dtype_cast(self, _dtype) if _dtype is not None else self
+                torch.Tensor.to = _xpu_persistent_tensor_to
 
-    if tiny:
-        # PEFT's cast_adapter_dtype calls param.data.to(torch.float32) on device tensors.
-        # Disable autocast so it skips the cast entirely; our Tensor.to patch handles any
-        # remaining calls, but avoiding them up-front is cleaner.
-        import peft.tuners.tuners_utils as _peft_utils
-        _orig_cast = _peft_utils.cast_adapter_dtype
-        def _xpu_cast_adapter_dtype(model, adapter_name, autocast_adapter_dtype=True):
-            _orig_cast(model, adapter_name, autocast_adapter_dtype=False)
-        _peft_utils.cast_adapter_dtype = _xpu_cast_adapter_dtype
+                # .float() bypasses Tensor.to on the Python side
+                _orig_tensor_float = torch.Tensor.float
+                def _xpu_persistent_float(self):
+                    if self.device.type == "xpu":
+                        return _xpu_safe_dtype_cast(self, torch.float32)
+                    return _orig_tensor_float(self)
+                torch.Tensor.float = _xpu_persistent_float
 
-    try:
-        model, tokenizer = FastModel.from_pretrained(
-            model_name=model_id,
-            max_seq_length=seq_len,
-            load_in_4bit=model_cfg.load_in_4bit,
-            dtype=_dtype,
-        )
-    except Exception as exc:
-        if model_cfg.fallback_model_id:
-            click.echo(f"  WARNING: {model_id} failed ({exc}). Falling back to {model_cfg.fallback_model_id}")
-            model_id = model_cfg.fallback_model_id
-            substituted = True
+                # PEFT's cast_adapter_dtype calls param.data.to(float32) on XPU tensors.
+                import peft.tuners.tuners_utils as _peft_utils
+                _orig_cast = _peft_utils.cast_adapter_dtype
+                def _xpu_cast_adapter_dtype(model, adapter_name, autocast_adapter_dtype=True):
+                    _orig_cast(model, adapter_name, autocast_adapter_dtype=False)
+                _peft_utils.cast_adapter_dtype = _xpu_cast_adapter_dtype
+
+                _load_dtype = torch.bfloat16  # XPU requires explicit dtype; load bf16 then cast to fp32 on CPU
+
+            if _local_device != "cuda":
+                # Training will happen on CPU (XPU compute may not be reliable; no CUDA present).
+                # bf16 AMP and 8-bit optimizers both require CUDA.
+                _use_grad_ckpt = False
+                _sft_overrides = {
+                    "use_cpu": True,
+                    "bf16": False,
+                    "optim": "adamw_torch",
+                }
+
+        try:
+            from unsloth import FastModel
+        except ImportError:
+            raise RuntimeError("Unsloth not installed. See: https://unsloth.ai/docs/get-started/install")
+
+        click.echo(f"  Loading {model_id} on {_local_device.upper() if local else 'CUDA'}...")
+
+        try:
             model, tokenizer = FastModel.from_pretrained(
                 model_name=model_id,
                 max_seq_length=seq_len,
                 load_in_4bit=model_cfg.load_in_4bit,
-                dtype=_dtype,
+                dtype=_load_dtype,
             )
-        else:
-            raise
+        except Exception as exc:
+            if model_cfg.fallback_model_id:
+                click.echo(f"  WARNING: {model_id} failed ({exc}). Falling back to {model_cfg.fallback_model_id}")
+                model_id = model_cfg.fallback_model_id
+                substituted = True
+                model, tokenizer = FastModel.from_pretrained(
+                    model_name=model_id,
+                    max_seq_length=seq_len,
+                    load_in_4bit=model_cfg.load_in_4bit,
+                    dtype=_load_dtype,
+                )
+            else:
+                raise
 
-    model = FastModel.get_peft_model(
-        model,
-        finetune_language_layers=True,
-        finetune_attention_modules=True,
-        finetune_mlp_modules=True,
-        r=lora_cfg.get("rank", 32),
-        lora_alpha=lora_cfg.get("alpha", 64),
-        lora_dropout=lora_cfg.get("dropout", 0.05),
-        bias="none",
-        use_rslora=lora_cfg.get("use_rslora", True),
-        use_gradient_checkpointing=False if tiny else "unsloth",
-    )
-
-    if tiny:
-        # XPU compute ops (pow, mean, etc.) fail on Intel Iris Xe Tiger Lake with
-        # UR_RESULT_ERROR_INVALID_ARGUMENT. Device transfers work, compute doesn't.
-        # Fall back to CPU for the actual training loop.
-        click.echo("  Moving model to CPU (XPU compute not supported on this device)...")
-        model = model.to("cpu")
-
-    from trl import SFTTrainer, SFTConfig
-    from transformers import TrainerCallback
-    import datasets as hf_datasets
-
-    class _CheckpointCallback(TrainerCallback):
-        """Sync lightweight state to network volume after each checkpoint so training can resume on pod restart."""
-        def on_save(self, args, state, control, **kwargs):
-            save_train_state(model_cfg.model_short, task_id, condition, {
-                "status": "in_progress",
-                "epoch": state.epoch,
-                "global_step": state.global_step,
-                "best_metric": state.best_metric,
-                "best_model_checkpoint": state.best_model_checkpoint,
-            })
-
-    with open(data_path) as f:
-        rows = [json.loads(line) for line in f]
-    train_ds = hf_datasets.Dataset.from_list(rows)
-
-    # Pre-apply the chat template so trl tokenizes a plain "text" field.
-    # When enable_thinking is explicitly False, suppress <think> tokens.
-    template_kwargs = {}
-    if model_cfg.enable_thinking is False:
-        template_kwargs["enable_thinking"] = False
-
-    def apply_template(example):
-        return {"text": tokenizer.apply_chat_template(
-            example["messages"],
-            tokenize=False,
-            add_generation_prompt=False,
-            **template_kwargs,
-        )}
-    train_ds = train_ds.map(apply_template)
-    dataset_text_field = "text"
-
-    training_cfg = model_cfg.training
-    if tiny:
-        sft_config = SFTConfig(
-            output_dir=str(ckpt_dir),
-            num_train_epochs=1,
-            per_device_train_batch_size=1,
-            gradient_accumulation_steps=1,
-            learning_rate=float(training_cfg.get("learning_rate", 2e-4)),
-            lr_scheduler_type="constant",
-            warmup_ratio=0.0,
-            weight_decay=training_cfg.get("weight_decay", 0.01),
-            optim="adamw_torch",
-            max_grad_norm=1.0,
-            use_cpu=True,
-            bf16=False,
-            fp16=False,
-            seed=training_cfg.get("seed", 42),
-            gradient_checkpointing=False,
-            save_strategy="no",
-            eval_strategy="no",
-            load_best_model_at_end=False,
-            logging_steps=1,
-            report_to="none",
-            max_seq_length=min(seq_len, 256),
-            dataset_text_field=dataset_text_field,
-            packing=False,
+        model = FastModel.get_peft_model(
+            model,
+            finetune_language_layers=True,
+            finetune_attention_modules=True,
+            finetune_mlp_modules=True,
+            r=lora_cfg.get("rank", 32),
+            lora_alpha=lora_cfg.get("alpha", 64),
+            lora_dropout=lora_cfg.get("dropout", 0.05),
+            bias="none",
+            use_rslora=lora_cfg.get("use_rslora", True),
+            use_gradient_checkpointing=_use_grad_ckpt,
         )
-    else:
-        sft_config = SFTConfig(
-            output_dir=str(ckpt_dir),  # HF intermediate checkpoints → network volume
+
+        if local and _local_device != "cuda":
+            # XPU: device transfers work but compute may not be reliable — move to CPU.
+            # Cast to float32: model was loaded in bf16 for XPU compat; CPU trains in fp32.
+            click.echo("  Moving model to CPU/float32...")
+            model = model.to("cpu").float()
+
+        from trl import SFTTrainer, SFTConfig
+        from transformers import TrainerCallback
+        import datasets as hf_datasets
+
+        class _CheckpointCallback(TrainerCallback):
+            def on_save(self, args, state, control, **kwargs):
+                save_train_state(model_cfg.model_short, task_id, condition, {
+                    "status": "in_progress",
+                    "epoch": state.epoch,
+                    "global_step": state.global_step,
+                    "best_metric": state.best_metric,
+                    "best_model_checkpoint": state.best_model_checkpoint,
+                })
+
+        with open(data_path) as f:
+            rows = [json.loads(line) for line in f]
+        train_ds = hf_datasets.Dataset.from_list(rows)
+
+        # Pre-apply the chat template so trl tokenizes a plain "text" field.
+        # When enable_thinking is explicitly False, suppress <think> tokens.
+        template_kwargs = {}
+        if model_cfg.enable_thinking is False:
+            template_kwargs["enable_thinking"] = False
+
+        def apply_template(example):
+            return {"text": tokenizer.apply_chat_template(
+                example["messages"],
+                tokenize=False,
+                add_generation_prompt=False,
+                **template_kwargs,
+            )}
+        train_ds = train_ds.map(apply_template)
+
+        training_cfg = model_cfg.training
+        sft_kwargs = dict(
+            output_dir=str(ckpt_dir),
             num_train_epochs=epochs,
             per_device_train_batch_size=training_cfg.get("per_device_train_batch_size", 4),
             gradient_accumulation_steps=training_cfg.get("gradient_accumulation_steps", 4),
@@ -354,60 +336,65 @@ def train_one(
             logging_steps=training_cfg.get("logging_steps", 10),
             report_to=training_cfg.get("report_to", "none"),
             max_seq_length=seq_len,
-            dataset_text_field=dataset_text_field,
+            dataset_text_field="text",
             packing=False,
         )
+        sft_kwargs.update(_sft_overrides)
+        sft_config = SFTConfig(**sft_kwargs)
 
-    trainer = SFTTrainer(
-        model=model, tokenizer=tokenizer, train_dataset=train_ds, args=sft_config,
-        callbacks=[_CheckpointCallback()],
-    )
+        trainer = SFTTrainer(
+            model=model, tokenizer=tokenizer, train_dataset=train_ds, args=sft_config,
+            callbacks=[_CheckpointCallback()],
+        )
 
-    t0 = time.time()
-    result = trainer.train(
-        resume_from_checkpoint=str(resume_ckpt) if resume_ckpt else None
-    )
-    elapsed_min = (time.time() - t0) / 60
-    training_cost = 0.0 if tiny else (elapsed_min / 60) * GPU_HOURLY
+        t0 = time.time()
+        result = trainer.train(
+            resume_from_checkpoint=str(resume_ckpt) if resume_ckpt else None
+        )
+        elapsed_min = (time.time() - t0) / 60
+        training_cost = 0.0 if local else (elapsed_min / 60) * GPU_HOURLY
 
-    model.save_pretrained(str(adapter_dir))
-    tokenizer.save_pretrained(str(adapter_dir))
+        model.save_pretrained(str(adapter_dir))
+        tokenizer.save_pretrained(str(adapter_dir))
 
-    # Mirror to network volume so adapter survives pod termination
-    # even if REPO_ROOT is on local pod disk.
-    nv_adapter_dir = ckpt_dir / "final_adapter"
-    shutil.copytree(str(adapter_dir), str(nv_adapter_dir), dirs_exist_ok=True)
+        nv_adapter_dir = ckpt_dir / "final_adapter"
+        shutil.copytree(str(adapter_dir), str(nv_adapter_dir), dirs_exist_ok=True)
 
-    eval_loss = result.metrics.get("eval_loss") if result.metrics else None
+        m = result.metrics or {}
+        eval_loss  = m.get("eval_loss")
+        train_loss = round(m["train_loss"], 4) if "train_loss" in m else None
 
-    meta = {
-        "model_id": model_cfg.model_short,
-        "task_id": task_id,
-        "condition": condition,
-        "n_train": n_train,
-        "epochs": epochs,
-        "seq_len": seq_len,
-        "training_cost": round(training_cost, 4),
-        "training_time_min": round(elapsed_min, 1),
-        "eval_loss": eval_loss,
-        "model_used": model_id,
-        "substituted": substituted,
-    }
-    atomic_write_json(meta, log_dir / "metadata.json")
-    atomic_write_json(meta, ckpt_dir / "metadata.json")
-    save_train_state(model_cfg.model_short, task_id, condition, {
-        "status": "complete",
-        "eval_loss": eval_loss,
-        "training_time_min": round(elapsed_min, 1),
-        "training_cost": round(training_cost, 4),
-    })
+        meta = {
+            "model_id": model_cfg.model_short,
+            "task_id": task_id,
+            "condition": condition,
+            "n_train": n_train,
+            "epochs": epochs,
+            "seq_len": seq_len,
+            "training_cost": round(training_cost, 4),
+            "training_time_min": round(elapsed_min, 1),
+            "eval_loss": eval_loss,
+            "train_loss": train_loss,
+            "model_used": model_id,
+            "substituted": substituted,
+        }
+        atomic_write_json(meta, log_dir / "metadata.json")
+        atomic_write_json(meta, ckpt_dir / "metadata.json")
+        save_train_state(model_cfg.model_short, task_id, condition, {
+            "status": "complete",
+            "eval_loss": eval_loss,
+            "train_loss": train_loss,
+            "training_time_min": round(elapsed_min, 1),
+            "training_cost": round(training_cost, 4),
+        })
 
-    click.echo(f"  Done: {elapsed_min:.1f} min, ${training_cost:.3f}, loss={eval_loss}")
+        loss_display = eval_loss if eval_loss is not None else train_loss
+        click.echo(f"  Done: {elapsed_min:.1f} min, ${training_cost:.3f}, loss={loss_display}")
 
-    if auto_upload:
-        _upload_adapter(model_cfg.model_short, task_id, condition)
+        if auto_upload:
+            _upload_adapter(model_cfg.model_short, task_id, condition)
 
-    return meta
+        return meta
 
 
 def _upload_adapter(model_short: str, task_id: str, condition: str) -> None:
@@ -423,14 +410,17 @@ def _upload_adapter(model_short: str, task_id: str, condition: str) -> None:
 
 
 @click.command()
-@click.option("--model", default="qwen3-8b", help="Model ID or 'all'")
+@click.option("--model", default=None, help="Model config ID or 'all'. Defaults to 'tiny' with --local, 'qwen3-8b' otherwise.")
 @click.option("--task", default="all", help="Task ID or 'all'")
 @click.option("--condition", default="all", help="lora-500|lora-full|all")
 @click.option("--auto-upload", is_flag=True, help="Upload adapter to HuggingFace after each run (persistence)")
 @click.option("--dry-run", is_flag=True, help="Validate configs without training")
-@click.option("--tiny", is_flag=True, help="Use XPU backend (Unsloth with Intel GPU support). Default uses CUDA.")
-def main(model: str, task: str, condition: str, auto_upload: bool, dry_run: bool, tiny: bool) -> None:
-    """QLoRA fine-tune on BANKING77 and CUAD via Unsloth (CUDA or Intel XPU)."""
+@click.option("--local", is_flag=True, help="Local dev mode: auto-detects hardware (CUDA > XPU > CPU), implies --model tiny.")
+def main(model: Optional[str], task: str, condition: str, auto_upload: bool, dry_run: bool, local: bool) -> None:
+    """QLoRA fine-tune one or more model/task/condition combinations."""
+    if model is None:
+        model = "tiny" if local else "qwen3-8b"
+
     model_ids = ALL_MODELS if model == "all" else [model]
     task_ids = ALL_TASKS if task == "all" else [task]
     conditions = ["lora-500", "lora-full"] if condition == "all" else [condition]
@@ -442,14 +432,19 @@ def main(model: str, task: str, condition: str, auto_upload: bool, dry_run: bool
             task_cfg = load_task_config(tid)  # load once per task, not per condition
             prepared_dir = REPO_ROOT / "data" / "prepared" / tid
             for cond in conditions:
-                data_file = prepared_dir / ("train_500.jsonl" if cond == "lora-500" else "train_full.jsonl")
+                filename = "train_500.jsonl" if cond == "lora-500" else "train_full.jsonl"
+                data_file = prepared_dir / filename
                 if not data_file.exists():
-                    click.echo(f"  SKIP [{mid}/{tid}/{cond}]: {data_file} not found", err=True)
-                    if not dry_run:
-                        failures.append((f"{mid}/{tid}/{cond}", "data file missing"))
-                    continue
+                    nv_file = nv_prepared_dir(tid) / filename
+                    if nv_file.exists():
+                        data_file = nv_file
+                    else:
+                        click.echo(f"  SKIP [{mid}/{tid}/{cond}]: {data_file} not found", err=True)
+                        if not dry_run:
+                            failures.append((f"{mid}/{tid}/{cond}", "data file missing"))
+                        continue
                 try:
-                    train_one(model_cfg, task_cfg, cond, data_file, dry_run, auto_upload=auto_upload, tiny=tiny)
+                    train_one(model_cfg, task_cfg, cond, data_file, dry_run, auto_upload=auto_upload, local=local)
                 except Exception as exc:
                     click.echo(f"  ERROR [{mid}/{tid}/{cond}]: {exc}", err=True)
                     traceback.print_exc()

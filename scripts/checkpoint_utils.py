@@ -1,4 +1,4 @@
-"""Fault-tolerant checkpoint and recovery utilities for remote GPU training.
+"""Checkpoint, recovery, and logging utilities for remote GPU training.
 
 Network volume layout (under NETWORK_VOLUME/checkpoints/<model>/<task>/<condition>/):
   checkpoint-N/      HF Trainer intermediate checkpoints (one per epoch)
@@ -11,8 +11,10 @@ Partial eval layout:
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Optional
@@ -85,6 +87,10 @@ def checkpoint_dir(model_short: str, task_id: str, condition: str) -> Path:
     return NETWORK_VOLUME / "checkpoints" / model_short / task_id / condition
 
 
+def nv_prepared_dir(task_id: str) -> Path:
+    return NETWORK_VOLUME / "data" / "prepared" / task_id
+
+
 def find_hf_resume_checkpoint(
     model_short: str, task_id: str, condition: str
 ) -> Optional[Path]:
@@ -115,3 +121,38 @@ def load_train_state(
         return None
     with open(path) as f:
         return json.load(f)
+
+
+# ── Training log ──────────────────────────────────────────────────────────────
+
+class _Tee:
+    def __init__(self, *streams):
+        self._s = streams
+
+    def write(self, data):
+        for s in self._s:
+            s.write(data)
+        self.flush()
+
+    def flush(self):
+        for s in self._s:
+            s.flush()
+
+    def isatty(self):
+        return False  # suppress ANSI escape codes and progress bars from tqdm/rich/click
+
+
+@contextlib.contextmanager
+def training_log(ckpt_dir: Path):
+    """Tee stdout/stderr to ckpt_dir/train.log for the duration of the block."""
+    log_path = ckpt_dir / "train.log"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    with open(log_path, "a") as fh:
+        orig_out, orig_err = sys.stdout, sys.stderr
+        sys.stdout = _Tee(orig_out, fh)
+        sys.stderr = _Tee(orig_err, fh)
+        try:
+            yield log_path
+        finally:
+            sys.stdout = orig_out
+            sys.stderr = orig_err
